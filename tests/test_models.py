@@ -112,9 +112,17 @@ def test_response():
     response = httpcore.Response(200)
     assert response.status == 200
     assert response.headers == []
+    assert response.trailers == []
     assert response.extensions == {}
     assert repr(response) == "<Response [200]>"
     assert repr(response.stream) == "<ByteStream [0 bytes]>"
+
+
+def test_response_with_trailers_extension():
+    trailers = [(b"X-Digest", b"abc123")]
+    response = httpcore.Response(200, extensions={"trailers": trailers})
+    assert response.status == 200
+    assert response.trailers == [(b"X-Digest", b"abc123")]
 
 
 # Tests for reading and streaming sync byte streams...

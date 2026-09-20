@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Add support for response trailers, available as `response.trailers` once the response body has been read to completion.
 
 ## Version 1.0.9 (April 24th, 2025)
 

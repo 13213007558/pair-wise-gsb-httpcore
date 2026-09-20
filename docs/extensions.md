@@ -210,6 +210,14 @@ When no key is included, a default based on the status code may be used.
 
 When HTTP/2 is being used the `"stream_id"` response extension can be accessed to determine the ID of the data stream that the response was sent on.
 
+### `"trailers"`
+
+The trailing headers of the response, as a list of two-tuples of bytes. For example `[(b"x-digest", b"abc123")]`.
+
+Trailers are only available once the response body has been read to completion. Responses that do not include any trailers, or that have not yet been read to completion, will include an empty list.
+
+The raw bytewise representation is preserved, including the ordering and any duplicate fields, and trailers are never mixed into the initial response headers. They can also be accessed using the `response.trailers` property.
+
 ### `"network_stream"`
 
 The `"network_stream"` extension allows developers to handle HTTP `CONNECT` and `Upgrade` requests, by providing an API that steps outside the standard request/response model, and can directly read or write to the network.

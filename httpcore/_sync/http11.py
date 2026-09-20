@@ -119,14 +119,19 @@ class HTTP11Connection(ConnectionInterface):
             ):
                 network_stream = HTTP11UpgradeStream(network_stream, trailing_data)
 
+            # The response trailers are populated once the response
+            # body has been read to completion.
+            trailers: list[tuple[bytes, bytes]] = []
+
             return Response(
                 status=status,
                 headers=headers,
-                content=HTTP11ConnectionByteStream(self, request),
+                content=HTTP11ConnectionByteStream(self, request, trailers=trailers),
                 extensions={
                     "http_version": http_version,
                     "reason_phrase": reason_phrase,
                     "network_stream": network_stream,
+                    "trailers": trailers,
                 },
             )
         except BaseException as exc:
@@ -194,7 +199,7 @@ class HTTP11Connection(ConnectionInterface):
         return http_version, event.status_code, event.reason, headers, trailing_data
 
     def _receive_response_body(
-        self, request: Request
+        self, request: Request, trailers: list[tuple[bytes, bytes]]
     ) -> typing.Iterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
@@ -203,7 +208,13 @@ class HTTP11Connection(ConnectionInterface):
             event = self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+            elif isinstance(event, h11.EndOfMessage):
+                # The EndOfMessage event includes any trailing headers.
+                # We use the raw bytewise representation, preserving the
+                # ordering and any duplicate fields.
+                trailers.extend(event.headers.raw_items())
+                break
+            elif isinstance(event, h11.PAUSED):
                 break
 
     def _receive_event(
@@ -322,17 +333,33 @@ class HTTP11Connection(ConnectionInterface):
 
 
 class HTTP11ConnectionByteStream:
-    def __init__(self, connection: HTTP11Connection, request: Request) -> None:
+    def __init__(
+        self,
+        connection: HTTP11Connection,
+        request: Request,
+        trailers: list[tuple[bytes, bytes]],
+    ) -> None:
         self._connection = connection
         self._request = request
+        self._trailers = trailers
         self._closed = False
 
     def __iter__(self) -> typing.Iterator[bytes]:
         kwargs = {"request": self._request}
         try:
             with Trace("receive_response_body", logger, self._request, kwargs):
-                for chunk in self._connection._receive_response_body(**kwargs):
-                    yield chunk
+                body = self._connection._receive_response_body(
+                    request=self._request, trailers=self._trailers
+                )
+                try:
+                    for chunk in body:
+                        yield chunk
+                finally:
+                    # Ensure the response body is reliably closed off,
+                    # even if the response is only partially streamed.
+                    close = getattr(body, "close", None)
+                    if close is not None:
+                        close()
         except BaseException as exc:
             # If we get an exception while streaming the response,
             # we want to close the response (and possibly the connection)

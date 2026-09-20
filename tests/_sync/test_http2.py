@@ -380,3 +380,158 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+
+def test_http2_connection_with_trailers():
+    """
+    Trailers sent as a final HEADERS frame are available on the response
+    once the body has been read to completion, preserving the raw bytes,
+    ordering, and any duplicate fields. They are not included in the
+    initial response headers.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello, world!").serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b"x-digest", b"abc123"),
+                        (b"x-digest", b"def456"),
+                    ]
+                ),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+            # A second request on the same connection, without any trailers.
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=3, data=b"No trailers", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.trailers == [
+            (b"x-digest", b"abc123"),
+            (b"x-digest", b"def456"),
+        ]
+        # The trailers are not mixed into the initial response headers.
+        assert response.headers == [(b"content-type", b"plain/text")]
+
+        # Requests reused across a connection do not share trailers.
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"No trailers"
+        assert response.trailers == []
+
+        assert conn.is_idle()
+        assert conn.is_available()
+
+
+
+def test_http2_connection_with_interleaved_stream_trailers():
+    """
+    Streams that complete in an interleaved fashion each get their own
+    trailers. The trailers from one stream must not leak into another.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            hyperframe.frame.SettingsFrame(
+                settings={hyperframe.frame.SettingsFrame.MAX_CONCURRENT_STREAMS: 2}
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+            hyperframe.frame.DataFrame(stream_id=3, data=b"World").serialize(),
+            # The second stream completes first...
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode([(b"x-stream", b"three")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+            # ...with the first stream completing after it.
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b"x-stream", b"one")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/one") as response_one:
+            with conn.stream(
+                "GET", "https://example.com/three"
+            ) as response_three:
+                assert response_one.read() == b"Hello"
+                assert response_one.trailers == [(b"x-stream", b"one")]
+                assert response_three.read() == b"World"
+                assert response_three.trailers == [(b"x-stream", b"three")]
+
+
+
+def test_http2_connection_with_invalid_trailers():
+    """
+    Trailers that violate the HTTP/2 protocol, such as a corrupted
+    HPACK block, are a protocol error. The response must not be
+    treated as if it had completed successfully.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+            # A corrupted HPACK block within the trailers.
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=b"\xff\xff\xff\xff",
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                response.read()
+            assert response.trailers == []
+
+        assert not conn.is_available()
