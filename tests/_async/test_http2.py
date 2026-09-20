@@ -380,3 +380,278 @@ async def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+@pytest.mark.anyio
+async def test_http2_connection_with_trailers():
+    """
+    Trailers sent after the response body are available on the response,
+    preserving ordering and any duplicate fields, and are not included
+    in the response headers.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello, world!").serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b"x-checksum", b"abc123"),
+                        (b"x-checksum", b"def456"),
+                        (b"x-token", b"xyz"),
+                    ]
+                ),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = await conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.headers == [(b"content-type", b"plain/text")]
+        assert response.trailers == [
+            (b"x-checksum", b"abc123"),
+            (b"x-checksum", b"def456"),
+            (b"x-token", b"xyz"),
+        ]
+
+        assert conn.is_idle()
+        assert not conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_http2_connection_with_empty_trailers():
+    """
+    Responses that do not include any trailers return an empty list.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = await conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.trailers == []
+
+
+@pytest.mark.anyio
+async def test_http2_connection_with_invalid_trailers():
+    """
+    Trailers that do not end the stream are a protocol error, rather
+    than silently returning a response that appears to be complete.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello, world!").serialize(),
+            # A trailers HEADERS frame is only valid with END_STREAM set.
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b"x-checksum", b"abc123")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore.RemoteProtocolError):
+            await conn.request("GET", "https://example.com/")
+
+
+@pytest.mark.anyio
+async def test_http2_connection_trailers_not_shared_across_requests():
+    """
+    Requests sent over a reused connection each get their own trailers,
+    rather than sharing a single mutable container.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b"x-checksum", b"abc123")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=3, data=b"World", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        first_response = await conn.request("GET", "https://example.com/")
+        assert first_response.trailers == [(b"x-checksum", b"abc123")]
+
+        second_response = await conn.request("GET", "https://example.com/")
+        assert second_response.trailers == []
+
+        # The trailers on the first response are unaffected by the second.
+        assert first_response.trailers == [(b"x-checksum", b"abc123")]
+
+
+@pytest.mark.anyio
+async def test_http2_connection_with_interleaved_trailers():
+    """
+    Two streams that complete while interleaved on a single connection
+    each receive their own trailers.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    settings = hyperframe.frame.SettingsFrame()
+    settings.settings[hyperframe.frame.SettingsFrame.MAX_CONCURRENT_STREAMS] = 2
+    stream = httpcore.AsyncMockStream(
+        [
+            settings.serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+            hyperframe.frame.DataFrame(stream_id=3, data=b"World").serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b"x-checksum", b"aaa")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode([(b"x-checksum", b"bbb")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/1") as response1:
+            async with conn.stream("GET", "https://example.com/2") as response2:
+                body1 = response1.aiter_stream()
+                body2 = response2.aiter_stream()
+                assert await body1.__anext__() == b"Hello"
+                assert await body2.__anext__() == b"World"
+                with pytest.raises(StopAsyncIteration):
+                    await body1.__anext__()
+                with pytest.raises(StopAsyncIteration):
+                    await body2.__anext__()
+
+        assert response1.trailers == [(b"x-checksum", b"aaa")]
+        assert response2.trailers == [(b"x-checksum", b"bbb")]
+
+
+@pytest.mark.anyio
+async def test_http2_connection_closed_midway_through_response():
+    """
+    Closing a response before it has been read to completion leaves
+    the trailers empty.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+            hyperframe.frame.DataFrame(stream_id=1, data=b", world!").serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b"x-checksum", b"abc123")]),
+                flags=["END_HEADERS", "END_STREAM"],
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with conn.stream("GET", "https://example.com/") as response:
+            body = response.aiter_stream()
+            async for chunk in body:
+                assert chunk == b"Hello"
+                break
+            await body.aclose()
+            # The response was closed before the trailers were received.
+            assert response.trailers == []

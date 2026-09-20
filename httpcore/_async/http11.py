@@ -194,7 +194,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         return http_version, event.status_code, event.reason, headers, trailing_data
 
     async def _receive_response_body(
-        self, request: Request
+        self, request: Request, trailers: list[tuple[bytes, bytes]]
     ) -> typing.AsyncIterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
@@ -203,7 +203,12 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             event = await self._receive_event(timeout=timeout)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
-            elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
+            elif isinstance(event, h11.EndOfMessage):
+                # Any trailers are included on the final event, once the
+                # response body has been read to completion.
+                trailers.extend(event.headers.raw_items())
+                break
+            elif isinstance(event, h11.PAUSED):
                 break
 
     async def _receive_event(
@@ -326,12 +331,19 @@ class HTTP11ConnectionByteStream:
         self._connection = connection
         self._request = request
         self._closed = False
+        # Trailers are populated once the response body has been read to
+        # completion. Each response gets its own list, so that trailers
+        # are never shared across responses.
+        self.trailers: list[tuple[bytes, bytes]] = []
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
         kwargs = {"request": self._request}
+        body = self._connection._receive_response_body(
+            request=self._request, trailers=self.trailers
+        )
         try:
             async with Trace("receive_response_body", logger, self._request, kwargs):
-                async for chunk in self._connection._receive_response_body(**kwargs):
+                async for chunk in body:
                     yield chunk
         except BaseException as exc:
             # If we get an exception while streaming the response,
@@ -340,6 +352,12 @@ class HTTP11ConnectionByteStream:
             with AsyncShieldCancellation():
                 await self.aclose()
             raise exc
+        finally:
+            # Ensure the response body generator is reliably closed,
+            # even if the response is closed part-way through.
+            aclose = getattr(body, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def aclose(self) -> None:
         if not self._closed:

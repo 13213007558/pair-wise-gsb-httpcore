@@ -400,6 +400,21 @@ class Response:
         self._stream_consumed = False
 
     @property
+    def trailers(self) -> list[tuple[bytes, bytes]]:
+        """
+        The response trailers, as a list of (name, value) two-tuples.
+
+        Trailers are sent by the server after the response body, and so are
+        only available once the response has been read to completion.
+        They are kept separate from the response headers, preserving the
+        raw byte casing, ordering, and any duplicate fields.
+
+        Responses that do not include any trailers return an empty list.
+        """
+        trailers = getattr(self.stream, "trailers", None)
+        return [] if trailers is None else list(trailers)
+
+    @property
     def content(self) -> bytes:
         if not hasattr(self, "_content"):
             if isinstance(self.stream, typing.Iterable):
@@ -429,7 +444,7 @@ class Response:
             self._content = b"".join([part for part in self.iter_stream()])
         return self._content
 
-    def iter_stream(self) -> typing.Iterator[bytes]:
+    def iter_stream(self) -> typing.Generator[bytes, None, None]:
         if not isinstance(self.stream, typing.Iterable):  # pragma: nocover
             raise RuntimeError(
                 "Attempted to stream an asynchronous response using 'for ... in "
@@ -441,8 +456,16 @@ class Response:
                 "Attempted to call 'for ... in response.iter_stream()' more than once."
             )
         self._stream_consumed = True
-        for chunk in self.stream:
-            yield chunk
+        iterator = self.stream.__iter__()
+        try:
+            for chunk in iterator:
+                yield chunk
+        finally:
+            # Ensure the underlying iterator is reliably closed,
+            # even if this generator is closed part-way through.
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
 
     def close(self) -> None:
         if not isinstance(self.stream, typing.Iterable):  # pragma: nocover
@@ -466,7 +489,7 @@ class Response:
             self._content = b"".join([part async for part in self.aiter_stream()])
         return self._content
 
-    async def aiter_stream(self) -> typing.AsyncIterator[bytes]:
+    async def aiter_stream(self) -> typing.AsyncGenerator[bytes, None]:
         if not isinstance(self.stream, typing.AsyncIterable):  # pragma: nocover
             raise RuntimeError(
                 "Attempted to stream an synchronous response using 'async for ... in "
@@ -479,8 +502,16 @@ class Response:
                 "more than once."
             )
         self._stream_consumed = True
-        async for chunk in self.stream:
-            yield chunk
+        iterator = self.stream.__aiter__()
+        try:
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            # Ensure the underlying iterator is reliably closed,
+            # even if this generator is closed part-way through.
+            aclose = getattr(iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     async def aclose(self) -> None:
         if not isinstance(self.stream, typing.AsyncIterable):  # pragma: nocover

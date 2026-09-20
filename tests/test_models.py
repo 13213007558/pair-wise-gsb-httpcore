@@ -112,6 +112,7 @@ def test_response():
     response = httpcore.Response(200)
     assert response.status == 200
     assert response.headers == []
+    assert response.trailers == []
     assert response.extensions == {}
     assert repr(response) == "<Response [200]>"
     assert repr(response.stream) == "<ByteStream [0 bytes]>"

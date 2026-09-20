@@ -378,3 +378,243 @@ def test_http11_header_sub_100kb():
         response = conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+class ReadFailureStream(httpcore.MockStream):
+    """
+    A mock stream that fails with a `ReadError` once the
+    buffered response bytes have been exhausted.
+    """
+
+    def read(self, max_bytes, timeout=None):
+        if not self._buffer:
+            raise httpcore.ReadError("Read failed")
+        return super().read(max_bytes, timeout)
+
+
+
+def test_http11_connection_with_trailers():
+    """
+    Trailers sent after a chunked response body are available on the
+    response, preserving the raw byte casing, ordering, and any duplicate
+    fields, and are not included in the response headers.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+            b"8\r\n, world!\r\n",
+            b"0\r\n",
+            b"X-Checksum: abc123\r\n",
+            b"x-checksum: def456\r\n",
+            b"X-Token: xyz\r\n",
+            b"\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.headers == [
+            (b"Content-Type", b"plain/text"),
+            (b"Transfer-Encoding", b"chunked"),
+        ]
+        assert response.trailers == [
+            (b"X-Checksum", b"abc123"),
+            (b"x-checksum", b"def456"),
+            (b"X-Token", b"xyz"),
+        ]
+
+        assert conn.is_idle()
+        assert not conn.is_closed()
+
+
+
+def test_http11_connection_with_trailers_split_across_reads():
+    """
+    Trailers that are split exactly across a chunk boundary in the
+    underlying byte stream are still reassembled correctly.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n0\r\nX-Check",
+            b"sum: abc123\r\n\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello"
+        assert response.trailers == [(b"X-Checksum", b"abc123")]
+
+
+
+def test_http11_connection_with_empty_trailers():
+    """
+    Responses that do not include any trailers return an empty list.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            # A chunked response with a `0\r\n\r\n` terminator and no trailers.
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+            b"0\r\n\r\n",
+            # A fixed content-length response, which never includes trailers.
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 5\r\n",
+            b"\r\n",
+            b"World",
+        ]
+    )
+    with httpcore.HTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello"
+        assert response.trailers == []
+
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"World"
+        assert response.trailers == []
+
+
+
+def test_http11_connection_trailers_not_shared_across_requests():
+    """
+    Requests sent over a reused connection each get their own trailers,
+    rather than sharing a single mutable container.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+            b"0\r\n",
+            b"X-Checksum: abc123\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 5\r\n",
+            b"\r\n",
+            b"World",
+        ]
+    )
+    with httpcore.HTTP11Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        first_response = conn.request("GET", "https://example.com/")
+        assert first_response.trailers == [(b"X-Checksum", b"abc123")]
+
+        second_response = conn.request("GET", "https://example.com/")
+        assert second_response.trailers == []
+
+        # The trailers on the first response are unaffected by the second.
+        assert first_response.trailers == [(b"X-Checksum", b"abc123")]
+
+
+
+def test_http11_connection_with_invalid_trailers():
+    """
+    Invalid trailers are treated as a protocol error, rather than
+    silently returning a response that appears to be complete.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+            b"0\r\n",
+            b"this is not a valid trailer\r\n",
+            b"\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore.RemoteProtocolError):
+            conn.request("GET", "https://example.com/")
+
+        assert conn.is_closed()
+
+
+
+def test_http11_connection_closed_midway_through_response():
+    """
+    Closing a response before it has been read to completion leaves
+    the trailers empty, and closes the connection.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+            b"8\r\n, world!\r\n",
+            b"0\r\n",
+            b"X-Checksum: abc123\r\n",
+            b"\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            body = response.iter_stream()
+            for chunk in body:
+                assert chunk == b"Hello"
+                break
+            body.close()
+            # The response was closed before the trailers were received.
+            assert response.trailers == []
+
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+
+def test_http11_connection_with_read_failure_during_response():
+    """
+    A read failure while streaming the response body propagates to the
+    caller, rather than returning a response that appears to be complete.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ReadFailureStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+            b"\r\n",
+            b"5\r\nHello\r\n",
+        ]
+    )
+    with httpcore.HTTP11Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            with pytest.raises(httpcore.ReadError):
+                response.read()
+            assert response.trailers == []
+
+        assert conn.is_closed()
