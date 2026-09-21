@@ -235,7 +235,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             (b":method", request.method),
             (b":authority", authority),
             (b":scheme", request.url.scheme),
-            (b":path", request.url.target),
+            (b":path", request.url.raw_path),
         ] + [
             (k.lower(), v)
             for k, v in request.headers

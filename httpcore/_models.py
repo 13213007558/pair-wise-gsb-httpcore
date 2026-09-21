@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import ssl
 import typing
 import urllib.parse
+from urllib.parse import urljoin
+
+from ._exceptions import InvalidURL
 
 # Functions for typechecking...
 
@@ -105,6 +109,143 @@ DEFAULT_PORTS = {
     b"wss": 443,
 }
 
+ZONE_ID_CHARACTERS = set(
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+)
+HEX_DIGITS = set(b"0123456789abcdefABCDEF")
+
+
+def _is_ipv6_host(host: bytes) -> bool:
+    return b":" in host
+
+
+def _is_valid_pct_encoded(value: bytes, index: int) -> bool:
+    return (
+        index + 2 < len(value)
+        and value[index + 1] in HEX_DIGITS
+        and value[index + 2] in HEX_DIGITS
+    )
+
+
+def _normalize_ipv6_host(host: bytes) -> bytes:
+    address, separator, zone = host.partition(b"%")
+    try:
+        normalized_address = str(ipaddress.IPv6Address(address.decode("ascii"))).encode(
+            "ascii"
+        )
+    except (UnicodeDecodeError, ipaddress.AddressValueError) as exc:
+        raise InvalidURL(f"Invalid IPv6 address: {host!r}") from exc
+
+    if not separator:
+        return normalized_address
+
+    if not zone.startswith(b"25"):
+        raise InvalidURL("IPv6 zone identifiers must use the '%25' delimiter.")
+    zone = zone[2:]
+    if not zone:
+        raise InvalidURL(f"Invalid IPv6 zone identifier: {host!r}")
+
+    index = 0
+    while index < len(zone):
+        char = zone[index]
+        if char == ord(b"%"):
+            if not _is_valid_pct_encoded(zone, index):
+                raise InvalidURL(f"Invalid IPv6 zone identifier: {host!r}")
+            index += 3
+        else:
+            if char not in ZONE_ID_CHARACTERS:
+                raise InvalidURL(f"Invalid IPv6 zone identifier: {host!r}")
+            index += 1
+
+    return normalized_address + b"%25" + zone
+
+
+def _validate_host(host: bytes) -> bytes:
+    if not host:
+        return host
+
+    if host.startswith(b"[") or host.endswith(b"]"):
+        if not (host.startswith(b"[") and host.endswith(b"]")):
+            raise InvalidURL(f"Invalid IPv6 address: {host!r}")
+        host = host[1:-1]
+
+    if _is_ipv6_host(host):
+        return _normalize_ipv6_host(host)
+    return host
+
+
+def _validate_port(port: int | None) -> int | None:
+    if port is not None and (
+        not isinstance(port, int) or isinstance(port, bool) or not (0 <= port <= 65535)
+    ):
+        raise InvalidURL(f"Invalid port: {port!r}")
+    return port
+
+
+def _host_authority(host: bytes, port: int | None = None) -> bytes:
+    authority = b"[" + host + b"]" if _is_ipv6_host(host) else host
+    if port is not None:
+        authority += b":%d" % port
+    return authority
+
+
+def _socket_host(host: bytes) -> str:
+    return host.replace(b"%25", b"%", 1).decode("ascii")
+
+
+def _tls_hostname(host: bytes) -> str | None:
+    hostname = _socket_host(host)
+    if _is_ipv6_host(host):
+        hostname = hostname.partition("%")[0]
+    return hostname or None
+
+
+def _parse_url(value: bytes) -> tuple[bytes, bytes, int | None, bytes]:
+    scheme, separator, remainder = value.partition(b"://")
+    if not separator or b"[" not in remainder:
+        try:
+            parsed = urllib.parse.urlparse(value)
+        except ValueError as exc:
+            raise InvalidURL(str(exc)) from exc
+        try:
+            port = _validate_port(parsed.port)
+        except ValueError as exc:
+            raise InvalidURL(str(exc)) from exc
+        target = (parsed.path or b"/") + (b"?" + parsed.query if parsed.query else b"")
+        return parsed.scheme, _validate_host(parsed.hostname or b""), port, target
+
+    authority_end_candidates = [
+        position
+        for position in (
+            remainder.find(b"/"),
+            remainder.find(b"?"),
+            remainder.find(b"#"),
+        )
+        if position >= 0
+    ]
+    authority_end = min(authority_end_candidates, default=len(remainder))
+    authority = remainder[:authority_end]
+    request_target = remainder[authority_end:].partition(b"#")[0] or b"/"
+
+    host_port = authority.rsplit(b"@", 1)[-1]
+    if not host_port.startswith(b"["):
+        raise InvalidURL(f"Invalid IPv6 address: {host_port!r}")
+    closing_bracket = host_port.find(b"]")
+    if closing_bracket < 0:
+        raise InvalidURL(f"Invalid IPv6 address: {host_port!r}")
+    host = _validate_host(host_port[1:closing_bracket])
+    port_bytes = host_port[closing_bracket + 1 :]
+    port = None
+    if port_bytes:
+        if not port_bytes.startswith(b":"):
+            raise InvalidURL(f"Invalid port: {port_bytes[1:]!r}")
+        try:
+            port = _validate_port(int(port_bytes[1:]))
+        except ValueError as exc:
+            raise InvalidURL(f"Invalid port: {port_bytes[1:]!r}") from exc
+
+    return scheme, host, port, request_target
+
 
 def include_request_headers(
     headers: list[tuple[bytes, bytes]],
@@ -116,10 +257,8 @@ def include_request_headers(
 
     if b"host" not in headers_set:
         default_port = DEFAULT_PORTS.get(url.scheme)
-        if url.port is None or url.port == default_port:
-            header_value = url.host
-        else:
-            header_value = b"%b:%d" % (url.host, url.port)
+        port = None if url.port is None or url.port == default_port else url.port
+        header_value = _host_authority(url.host, port)
         headers = [(b"Host", header_value)] + headers
 
     if (
@@ -160,8 +299,9 @@ class ByteStream:
 
 class Origin:
     def __init__(self, scheme: bytes, host: bytes, port: int) -> None:
-        self.scheme = scheme
-        self.host = host
+        self.scheme = enforce_bytes(scheme, name="scheme")
+        self.host = _validate_host(enforce_bytes(host, name="host"))
+        _validate_port(port)
         self.port = port
 
     def __eq__(self, other: typing.Any) -> bool:
@@ -174,9 +314,24 @@ class Origin:
 
     def __str__(self) -> str:
         scheme = self.scheme.decode("ascii")
-        host = self.host.decode("ascii")
+        host = _host_authority(self.host).decode("ascii")
         port = str(self.port)
         return f"{scheme}://{host}:{port}"
+
+    def __hash__(self) -> int:
+        return hash((self.scheme, self.host, self.port))
+
+    @property
+    def authority(self) -> bytes:
+        return _host_authority(self.host, self.port)
+
+    @property
+    def socket_host(self) -> str:
+        return _socket_host(self.host)
+
+    @property
+    def tls_hostname(self) -> str | None:
+        return _tls_hostname(self.host)
 
 
 class URL:
@@ -254,6 +409,7 @@ class URL:
         host: bytes | str = b"",
         port: int | None = None,
         target: bytes | str = b"",
+        raw_path: bytes | str | None = None,
     ) -> None:
         """
         Parameters:
@@ -263,20 +419,19 @@ class URL:
             host: The URL host as a string or bytes. Such as `"www.example.com"`.
             port: The port to connect to. Either an integer or `None`.
             target: The target of the HTTP request. Such as `"/items?search=red"`.
+            raw_path: Deprecated alias for the `target` parameter.
         """
         if url:
-            parsed = urllib.parse.urlparse(enforce_bytes(url, name="url"))
-            self.scheme = parsed.scheme
-            self.host = parsed.hostname or b""
-            self.port = parsed.port
-            self.target = (parsed.path or b"/") + (
-                b"?" + parsed.query if parsed.query else b""
+            self.scheme, self.host, self.port, self.target = _parse_url(
+                enforce_bytes(url, name="url")
             )
         else:
             self.scheme = enforce_bytes(scheme, name="scheme")
-            self.host = enforce_bytes(host, name="host")
-            self.port = port
-            self.target = enforce_bytes(target, name="target")
+            self.host = _validate_host(enforce_bytes(host, name="host"))
+            self.port = _validate_port(port)
+            self.target = enforce_bytes(
+                raw_path if raw_path is not None else target, name="target"
+            )
 
     @property
     def origin(self) -> Origin:
@@ -292,6 +447,16 @@ class URL:
             scheme=self.scheme, host=self.host, port=self.port or default_port
         )
 
+    @property
+    def raw_path(self) -> bytes:
+        return self.target
+
+    @property
+    def authority(self) -> bytes:
+        default_port = DEFAULT_PORTS.get(self.scheme)
+        port = None if self.port is None or self.port == default_port else self.port
+        return _host_authority(self.host, port)
+
     def __eq__(self, other: typing.Any) -> bool:
         return (
             isinstance(other, URL)
@@ -302,9 +467,45 @@ class URL:
         )
 
     def __bytes__(self) -> bytes:
-        if self.port is None:
-            return b"%b://%b%b" % (self.scheme, self.host, self.target)
-        return b"%b://%b:%d%b" % (self.scheme, self.host, self.port, self.target)
+        return (
+            self.scheme + b"://" + _host_authority(self.host, self.port) + self.target
+        )
+
+    def __str__(self) -> str:
+        return bytes(self).decode("ascii", errors="replace")
+
+    def __hash__(self) -> int:
+        return hash(bytes(self))
+
+    def copy(
+        self,
+        *,
+        scheme: bytes | str | None = None,
+        host: bytes | str | None = None,
+        port: int | None = -1,
+        target: bytes | str | None = None,
+        raw_path: bytes | str | None = None,
+    ) -> "URL":
+        if target is not None and raw_path is not None:
+            raise TypeError("Cannot specify both 'target' and 'raw_path'.")
+        copied_target = self.target if target is None else target
+        if raw_path is not None:
+            copied_target = raw_path
+        return URL(
+            scheme=self.scheme if scheme is None else scheme,
+            host=self.host if host is None else host,
+            port=self.port if port == -1 else port,
+            target=copied_target,
+        )
+
+    def copy_with(self, **kwargs: typing.Any) -> "URL":
+        return self.copy(**kwargs)
+
+    def join(self, url: "URL | bytes | str") -> "URL":
+        reference = (
+            bytes(url) if isinstance(url, URL) else enforce_bytes(url, name="url")
+        )
+        return URL(urljoin(bytes(self), reference))
 
     def __repr__(self) -> str:
         return (

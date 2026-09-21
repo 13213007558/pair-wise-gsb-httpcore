@@ -114,7 +114,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             try:
                 if self._uds is None:
                     kwargs = {
-                        "host": self._origin.host.decode("ascii"),
+                        "host": self._origin.socket_host,
                         "port": self._origin.port,
                         "local_address": self._local_address,
                         "timeout": timeout,
@@ -148,8 +148,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
 
                     kwargs = {
                         "ssl_context": ssl_context,
-                        "server_hostname": sni_hostname
-                        or self._origin.host.decode("ascii"),
+                        "server_hostname": sni_hostname or self._origin.tls_hostname,
                         "timeout": timeout,
                     }
                     async with Trace("start_tls", logger, request, kwargs) as trace:

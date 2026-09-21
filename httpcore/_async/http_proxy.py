@@ -190,6 +190,9 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
 
     async def handle_async_request(self, request: Request) -> Response:
         headers = merge_headers(self._proxy_headers, request.headers)
+        extensions = {
+            key: value for key, value in request.extensions.items() if key != "target"
+        }
         url = URL(
             scheme=self._proxy_origin.scheme,
             host=self._proxy_origin.host,
@@ -201,7 +204,7 @@ class AsyncForwardHTTPConnection(AsyncConnectionInterface):
             url=url,
             headers=headers,
             content=request.stream,
-            extensions=request.extensions,
+            extensions=extensions,
         )
         return await self._connection.handle_async_request(proxy_request)
 
@@ -268,7 +271,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if not self._connected:
-                target = b"%b:%d" % (self._remote_origin.host, self._remote_origin.port)
+                target = self._remote_origin.authority
 
                 connect_url = URL(
                     scheme=self._proxy_origin.scheme,
@@ -283,20 +286,22 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                     method=b"CONNECT",
                     url=connect_url,
                     headers=connect_headers,
-                    extensions=request.extensions,
+                    extensions={
+                        key: value
+                        for key, value in request.extensions.items()
+                        if key != "target"
+                    },
                 )
-                connect_response = await self._connection.handle_async_request(
-                    connect_request
-                )
+                response = await self._connection.handle_async_request(connect_request)
 
-                if connect_response.status < 200 or connect_response.status > 299:
-                    reason_bytes = connect_response.extensions.get("reason_phrase", b"")
+                if response.status < 200 or response.status > 299:
+                    reason_bytes = response.extensions.get("reason_phrase", b"")
                     reason_str = reason_bytes.decode("ascii", errors="ignore")
-                    msg = "%d %s" % (connect_response.status, reason_str)
+                    msg = "%d %s" % (response.status, reason_str)
                     await self._connection.aclose()
                     raise ProxyError(msg)
 
-                stream = connect_response.extensions["network_stream"]
+                stream = response.extensions["network_stream"]
 
                 # Upgrade the stream to SSL
                 ssl_context = (
@@ -309,7 +314,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
                 kwargs = {
                     "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
+                    "server_hostname": self._remote_origin.tls_hostname,
                     "timeout": timeout,
                 }
                 async with Trace("start_tls", logger, request, kwargs) as trace:

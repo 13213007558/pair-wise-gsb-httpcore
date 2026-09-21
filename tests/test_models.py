@@ -4,6 +4,112 @@ import pytest
 
 import httpcore
 
+
+@pytest.mark.parametrize(
+    ("url", "host", "port", "authority", "origin"),
+    [
+        (
+            "http://[FE80::1%25en0]/path?x=1",
+            b"fe80::1%25en0",
+            None,
+            b"[fe80::1%25en0]",
+            httpcore.Origin(b"http", b"fe80::1%25en0", 80),
+        ),
+        (
+            "http://[fe80::1%25en0]:8080/path",
+            b"fe80::1%25en0",
+            8080,
+            b"[fe80::1%25en0]:8080",
+            httpcore.Origin(b"http", b"fe80::1%25en0", 8080),
+        ),
+        (
+            "https://[2001:db8::1%25eth0%2f2]/",
+            b"2001:db8::1%25eth0%2f2",
+            None,
+            b"[2001:db8::1%25eth0%2f2]",
+            httpcore.Origin(b"https", b"2001:db8::1%25eth0%2f2", 443),
+        ),
+    ],
+)
+def test_url_ipv6_zone_identifier(url, host, port, authority, origin):
+    parsed = httpcore.URL(url)
+    assert parsed.scheme == origin.scheme
+    assert parsed.host == host
+    assert parsed.port == port
+    assert parsed.raw_path == parsed.target
+    assert parsed.authority == authority
+    assert parsed.origin == origin
+    assert bytes(parsed).startswith(parsed.scheme + b"://[")
+    assert authority in bytes(parsed)
+    assert parsed.origin.socket_host == host.replace(b"%25", b"%", 1).decode()
+    assert parsed.origin.tls_hostname is not None
+    assert b"%25" not in parsed.origin.tls_hostname.encode()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[fe80::1%en0]/",
+        "http://[fe80::1%25]/",
+        "http://[fe80::1%25%zz]/",
+        "http://[fe80::zzzz]/",
+        "http://[fe80::1/",
+        "http://[fe80::1]:99999/",
+    ],
+)
+def test_url_with_invalid_ipv6_authority(url):
+    with pytest.raises(httpcore.InvalidURL):
+        httpcore.URL(url)
+    with pytest.raises(httpcore.InvalidURL):
+        httpcore.Request("GET", url)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"raw_path": b"/other?x=1"}, b"http://[fe80::1%25en0]:8080/other?x=1"),
+        (
+            {"host": b"fe80::1%25eth1"},
+            b"http://[fe80::1%25eth1]:8080/path",
+        ),
+        ({"port": 8081}, b"http://[fe80::1%25en0]:8081/path"),
+    ],
+)
+def test_url_copy_preserves_ipv6_zone_authority(kwargs, expected):
+    url = httpcore.URL("http://[fe80::1%25en0]:8080/path")
+    copied = url.copy(**kwargs)
+    assert bytes(copied) == expected
+    assert copied is not url
+
+
+@pytest.mark.parametrize(
+    ("relative", "expected"),
+    [
+        ("/other", b"http://[fe80::1%25en0]:8080/other"),
+        (b"../other?x=1", b"http://[fe80::1%25en0]:8080/other?x=1"),
+        (
+            "http://[fe80::1%25eth1]/joined",
+            b"http://[fe80::1%25eth1]/joined",
+        ),
+    ],
+)
+def test_url_join_preserves_ipv6_zone_authority(relative, expected):
+    url = httpcore.URL("http://[fe80::1%25en0]:8080/a/base")
+    assert bytes(url.join(relative)) == expected
+
+
+def test_ipv6_zone_origin_pool_key():
+    default = httpcore.URL("http://[fe80::1%25en0]/").origin
+    other_zone = httpcore.URL("http://[fe80::1%25eth1]/").origin
+    explicit_port = httpcore.URL("http://[fe80::1%25en0]:8080/").origin
+    other_port = httpcore.URL("http://[fe80::1%25en0]:8081/").origin
+
+    assert default == httpcore.Origin(b"http", b"fe80::1%25en0", 80)
+    assert len({default, other_zone, explicit_port, other_port}) == 4
+    assert default.authority == b"[fe80::1%25en0]:80"
+    assert explicit_port.authority == b"[fe80::1%25en0]:8080"
+
+
 # URL
 
 

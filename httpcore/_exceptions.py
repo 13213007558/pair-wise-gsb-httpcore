@@ -27,6 +27,10 @@ class UnsupportedProtocol(Exception):
     pass
 
 
+class InvalidURL(Exception):
+    pass
+
+
 class ProtocolError(Exception):
     pass
 
