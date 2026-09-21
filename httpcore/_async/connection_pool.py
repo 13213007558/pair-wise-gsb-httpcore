@@ -157,6 +157,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 proxy_origin=self._proxy.url.origin,
                 proxy_headers=self._proxy.headers,
                 proxy_ssl_context=self._proxy.ssl_context,
+                proxy_auth_callback=self._proxy.auth_callback,
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
                 keepalive_expiry=self._keepalive_expiry,

@@ -3,10 +3,11 @@ from __future__ import annotations
 import base64
 import logging
 import ssl
+import time
 import typing
 
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ProxyError
+from .._exceptions import ConnectTimeout, ProxyError
 from .._models import (
     URL,
     Origin,
@@ -17,7 +18,7 @@ from .._models import (
     enforce_url,
 )
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection import AsyncHTTPConnection
 from .connection_pool import AsyncConnectionPool
@@ -30,6 +31,48 @@ HeadersAsMapping = typing.Mapping[ByteOrStr, ByteOrStr]
 
 
 logger = logging.getLogger("httpcore.proxy")
+
+# The maximum number of times we'll re-issue a CONNECT request in response
+# to a proxy authentication challenge.
+MAX_AUTH_ATTEMPTS = 1
+
+
+def basic_auth_header(username: bytes, password: bytes) -> tuple[bytes, bytes]:
+    userpass = username + b":" + password
+    return (b"Proxy-Authorization", b"Basic " + base64.b64encode(userpass))
+
+
+def remaining_timeout(timeout: float | None, elapsed: float) -> float | None:
+    """
+    Given an overall timeout budget and the time already spent, return the
+    remaining budget. Raises `ConnectTimeout` if the budget has been
+    exhausted.
+    """
+    if timeout is None:
+        return None
+    remaining = timeout - elapsed
+    if remaining <= 0:
+        raise ConnectTimeout("Timed out while establishing proxy tunnel")
+    return remaining
+
+
+async def invoke_auth_callback(
+    auth_callback: typing.Callable[..., typing.Any],
+    proxy_authenticate: bytes | None,
+) -> tuple[bytes, bytes] | None:
+    """
+    Invoke a proxy authentication callback with the `Proxy-Authenticate`
+    challenge, and return a `(username, password)` two-tuple, or `None`
+    if no credentials could be obtained.
+    """
+    result = auth_callback(proxy_authenticate)
+    if result is None:
+        return None
+    username, password = result
+    return (
+        enforce_bytes(username, name="auth"),
+        enforce_bytes(password, name="auth"),
+    )
 
 
 def merge_headers(
@@ -61,6 +104,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         proxy_url: URL | bytes | str,
         proxy_auth: tuple[bytes | str, bytes | str] | None = None,
         proxy_headers: HeadersAsMapping | HeadersAsSequence | None = None,
+        proxy_auth_callback: typing.Callable[..., typing.Any] | None = None,
         ssl_context: ssl.SSLContext | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
         max_connections: int | None = 10,
@@ -133,15 +177,14 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
 
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
+        self._proxy_auth_callback = proxy_auth_callback
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
         if proxy_auth is not None:
             username = enforce_bytes(proxy_auth[0], name="proxy_auth")
             password = enforce_bytes(proxy_auth[1], name="proxy_auth")
-            userpass = username + b":" + password
-            authorization = b"Basic " + base64.b64encode(userpass)
-            self._proxy_headers = [
-                (b"Proxy-Authorization", authorization)
-            ] + self._proxy_headers
+            self._proxy_headers = [basic_auth_header(username, password)] + (
+                self._proxy_headers
+            )
 
     def create_connection(self, origin: Origin) -> AsyncConnectionInterface:
         if origin.scheme == b"http":
@@ -156,6 +199,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         return AsyncTunnelHTTPConnection(
             proxy_origin=self._proxy_url.origin,
             proxy_headers=self._proxy_headers,
+            proxy_auth_callback=self._proxy_auth_callback,
             remote_origin=origin,
             ssl_context=self._ssl_context,
             proxy_ssl_context=self._proxy_ssl_context,
@@ -238,6 +282,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         ssl_context: ssl.SSLContext | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
         proxy_headers: typing.Sequence[tuple[bytes, bytes]] | None = None,
+        proxy_auth_callback: typing.Callable[..., typing.Any] | None = None,
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
@@ -255,6 +300,7 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         self._remote_origin = remote_origin
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
+        self._proxy_auth_callback = proxy_auth_callback
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
         self._keepalive_expiry = keepalive_expiry
         self._http1 = http1
@@ -268,8 +314,11 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if not self._connected:
-                target = b"%b:%d" % (self._remote_origin.host, self._remote_origin.port)
-
+                start = time.monotonic()
+                target = b"%b:%d" % (
+                    self._remote_origin.host,
+                    self._remote_origin.port,
+                )
                 connect_url = URL(
                     scheme=self._proxy_origin.scheme,
                     host=self._proxy_origin.host,
@@ -277,28 +326,77 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                     target=target,
                 )
                 connect_headers = merge_headers(
-                    [(b"Host", target), (b"Accept", b"*/*")], self._proxy_headers
-                )
-                connect_request = Request(
-                    method=b"CONNECT",
-                    url=connect_url,
-                    headers=connect_headers,
-                    extensions=request.extensions,
-                )
-                connect_response = await self._connection.handle_async_request(
-                    connect_request
+                    [(b"Host", target), (b"Accept", b"*/*")],
+                    self._proxy_headers,
                 )
 
-                if connect_response.status < 200 or connect_response.status > 299:
-                    reason_bytes = connect_response.extensions.get("reason_phrase", b"")
-                    reason_str = reason_bytes.decode("ascii", errors="ignore")
-                    msg = "%d %s" % (connect_response.status, reason_str)
-                    await self._connection.aclose()
-                    raise ProxyError(msg)
+                # Issue the CONNECT request, transparently skipping any
+                # interim 1xx responses (e.g. `100 Continue`) until a
+                # final response is received. A `407 Proxy Authentication
+                # Required` may trigger a single authenticated retry.
+                auth_attempts = 0
+                while True:
+                    try:
+                        connect_request = self._build_connect_request(
+                            url=connect_url,
+                            headers=connect_headers,
+                            request=request,
+                            timeout=remaining_timeout(
+                                timeout, time.monotonic() - start
+                            ),
+                        )
+                        connect_response = await self._connection.handle_async_request(
+                            connect_request
+                        )
+
+                        if 200 <= connect_response.status < 300:
+                            # Only a 2xx response establishes the tunnel.
+                            break
+
+                        # Drain any error response body so that the underlying
+                        # keep-alive proxy connection is left in a clean state.
+                        await self._drain_response(connect_response)
+
+                        if (
+                            connect_response.status == 407
+                            and auth_attempts < MAX_AUTH_ATTEMPTS
+                            and self._proxy_auth_callback is not None
+                        ):
+                            challenge = self._proxy_authenticate_header(
+                                connect_response
+                            )
+                            credentials = await invoke_auth_callback(
+                                self._proxy_auth_callback, challenge
+                            )
+                            if credentials is not None:
+                                connect_headers = merge_headers(
+                                    connect_headers,
+                                    [basic_auth_header(*credentials)],
+                                )
+                                auth_attempts += 1
+                                continue
+
+                        reason_bytes = connect_response.extensions.get(
+                            "reason_phrase", b""
+                        )
+                        reason_str = reason_bytes.decode("ascii", errors="ignore")
+                        msg = "%d %s" % (
+                            connect_response.status,
+                            reason_str,
+                        )
+                        raise ProxyError(msg)
+                    except BaseException:
+                        # Cancellation or any other failure must release
+                        # the underlying proxy network stream, and drop the
+                        # broken connection from the pool.
+                        with AsyncShieldCancellation():
+                            await self._connection.aclose()
+                        raise
 
                 stream = connect_response.extensions["network_stream"]
 
-                # Upgrade the stream to SSL
+                # Upgrade the stream to SSL. The timeout budget covers the
+                # CONNECT handshake as well as the TLS upgrade.
                 ssl_context = (
                     default_ssl_context()
                     if self._ssl_context is None
@@ -310,37 +408,87 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                 kwargs = {
                     "ssl_context": ssl_context,
                     "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": timeout,
+                    "timeout": remaining_timeout(timeout, time.monotonic() - start),
                 }
-                async with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = await stream.start_tls(**kwargs)
-                    trace.return_value = stream
+                try:
+                    async with Trace("start_tls", logger, request, kwargs) as trace:
+                        stream = await stream.start_tls(**kwargs)
+                        trace.return_value = stream
 
-                # Determine if we should be using HTTP/1.1 or HTTP/2
-                ssl_object = stream.get_extra_info("ssl_object")
-                http2_negotiated = (
-                    ssl_object is not None
-                    and ssl_object.selected_alpn_protocol() == "h2"
-                )
-
-                # Create the HTTP/1.1 or HTTP/2 connection
-                if http2_negotiated or (self._http2 and not self._http1):
-                    from .http2 import AsyncHTTP2Connection
-
-                    self._connection = AsyncHTTP2Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
-                    )
-                else:
-                    self._connection = AsyncHTTP11Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
+                    # Determine if we should be using HTTP/1.1 or HTTP/2
+                    ssl_object = stream.get_extra_info("ssl_object")
+                    http2_negotiated = (
+                        ssl_object is not None
+                        and ssl_object.selected_alpn_protocol() == "h2"
                     )
 
-                self._connected = True
+                    # Create the HTTP/1.1 or HTTP/2 connection
+                    if http2_negotiated or (self._http2 and not self._http1):
+                        from .http2 import AsyncHTTP2Connection
+
+                        self._connection = AsyncHTTP2Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+                    else:
+                        self._connection = AsyncHTTP11Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+
+                    self._connected = True
+                except BaseException:
+                    # If the TLS upgrade fails, make sure the established
+                    # tunnel stream is released. The underlying proxy
+                    # connection can no longer be used after a successful
+                    # CONNECT, so it is closed and dropped from the pool.
+                    with AsyncShieldCancellation():
+                        await self._connection.aclose()
+                    raise
+
         return await self._connection.handle_async_request(request)
+
+    def _build_connect_request(
+        self,
+        url: URL,
+        headers: typing.Sequence[tuple[bytes, bytes]],
+        request: Request,
+        timeout: float | None,
+    ) -> Request:
+        extensions = dict(request.extensions)
+        extensions["timeout"] = {
+            **extensions.get("timeout", {}),
+            "connect": timeout,
+            "read": timeout,
+            "write": timeout,
+        }
+        return Request(
+            method=b"CONNECT",
+            url=url,
+            headers=list(headers),
+            extensions=extensions,
+        )
+
+    def _proxy_authenticate_header(self, response: Response) -> bytes | None:
+        for key, value in response.headers:
+            if key.lower() == b"proxy-authenticate":
+                return value
+        return None
+
+    async def _drain_response(self, response: Response) -> None:
+        """
+        Read and discard a failed CONNECT response body, so the underlying
+        proxy connection is returned to an IDLE, reusable state. The read
+        timeout is taken from the CONNECT request extensions, and thus
+        honours the remaining timeout budget.
+        """
+        try:
+            async for _chunk in response.aiter_stream():
+                pass
+        finally:
+            await response.aclose()
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._remote_origin

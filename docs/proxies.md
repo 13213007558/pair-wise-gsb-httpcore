@@ -54,6 +54,27 @@ proxy = httpcore.Proxy(
 pool = httpcore.ConnectionPool(proxy=proxy)
 ```
 
+If the proxy responds to a `CONNECT` request with a `407 Proxy
+Authentication Required` challenge, an authentication callback may be
+used to obtain credentials in response to the `Proxy-Authenticate`
+challenge. The challenged `CONNECT` is then retried once with the
+resulting credentials:
+
+```python
+import httpcore
+
+def auth_callback(proxy_authenticate):
+    # The argument is the raw `Proxy-Authenticate` header value, or `None`.
+    # Return a `(username, password)` two-tuple, or `None` to give up.
+    return ("<username>", "<password>")
+
+proxy = httpcore.Proxy(
+    url="http://127.0.0.1:8080/",
+    auth_callback=auth_callback,
+)
+pool = httpcore.ConnectionPool(proxy=proxy)
+```
+
 ## Proxy SSL
 
 The `httpcore` package also supports HTTPS proxies for http and https destinations.

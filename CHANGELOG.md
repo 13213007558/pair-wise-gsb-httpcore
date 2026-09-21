@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Handle `100 Continue` interim responses during proxy `CONNECT`
+  handshakes, and support a single authenticated retry in response to a
+  `407 Proxy Authentication Required` via `Proxy(auth_callback=...)`.
+  The `connect` timeout budget now accumulates across the CONNECT exchange
+  and the TLS upgrade, and network streams are always released on failure
+  or cancellation.
 
 ## Version 1.0.9 (April 24th, 2025)
 
