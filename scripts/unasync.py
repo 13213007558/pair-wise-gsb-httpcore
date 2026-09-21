@@ -8,6 +8,7 @@ SUBS = [
     ('from .._backends.auto import AutoBackend', 'from .._backends.sync import SyncBackend'),
     ('import trio as concurrency', 'from tests import concurrency'),
     ('AsyncIterator', 'Iterator'),
+    ('AsyncOneShotBody', 'SyncOneShotBody'),
     ('Async([A-Z][A-Za-z0-9_]*)', r'\2'),
     ('async def', 'def'),
     ('async with', 'with'),
@@ -25,19 +26,41 @@ SUBS = [
     ('@pytest.mark.trio', ''),
     ('AutoBackend', 'SyncBackend'),
 ]
+DIRECT_SUBS = [
+    ('StopAsyncIteration', 'StopIteration'),
+    ('__anext__', '__next__'),
+]
 COMPILED_SUBS = [
     (re.compile(r'(^|\b)' + regex + r'($|\b)'), repl)
     for regex, repl in SUBS
+]
+DIRECT_COMPILED_SUBS = [
+    (re.compile(regex), repl) for regex, repl in DIRECT_SUBS
 ]
 
 USED_SUBS = set()
 
 def unasync_line(line):
+    for regex, repl in DIRECT_COMPILED_SUBS:
+        line = re.sub(regex, repl, line)
     for index, (regex, repl) in enumerate(COMPILED_SUBS):
         old_line = line
         line = re.sub(regex, repl, line)
         if old_line != line:
             USED_SUBS.add(index)
+    line = line.replace("    authorization = authorization", "")
+    line = line.replace(
+        "if not inspect.isawaitable(authorization):",
+        "if inspect.isawaitable(authorization):",
+    )
+    line = line.replace(
+        "\"If you're using an asynchronous interface, the proxy authentication \"",
+        "\"If you're using a synchronous interface, the proxy authentication \"",
+    )
+    line = line.replace(
+        "\"callback must be an asynchronous function.\"",
+        "\"callback must be a normal function.\"",
+    )
     return line
 
 

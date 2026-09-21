@@ -500,10 +500,12 @@ class Proxy:
         auth: tuple[bytes | str, bytes | str] | None = None,
         headers: HeadersAsMapping | HeadersAsSequence | None = None,
         ssl_context: ssl.SSLContext | None = None,
+        auth_callback: typing.Callable[..., typing.Any] | None = None,
     ):
         self.url = enforce_url(url, name="url")
         self.headers = enforce_headers(headers, name="headers")
         self.ssl_context = ssl_context
+        self.auth_callback = auth_callback
 
         if auth is not None:
             username = enforce_bytes(auth[0], name="auth")

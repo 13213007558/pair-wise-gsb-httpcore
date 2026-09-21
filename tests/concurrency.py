@@ -9,6 +9,7 @@ We don't do any smarts around cancellations, or managing exceptions from
 childen, because we don't need that for our use-case.
 """
 
+import time
 import threading
 from types import TracebackType
 from typing import Any, Callable, List, Optional, Type
@@ -28,14 +29,32 @@ class Nursery:
         traceback: Optional[TracebackType] = None,
     ) -> None:
         for thread in self._threads:
-            thread.start()
-        for thread in self._threads:
             thread.join()
 
     def start_soon(self, func: Callable[..., object], *args: Any) -> None:
         thread = threading.Thread(target=func, args=args)
         self._threads.append(thread)
+        thread.start()
 
 
 def open_nursery() -> Nursery:
     return Nursery()
+
+
+class Event:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def wait(self) -> None:
+        self._event.wait()
+
+    def set(self) -> None:
+        self._event.set()
+
+
+def sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def sleep_forever() -> None:
+    threading.Event().wait()

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import logging
 import ssl
+import time
 import typing
 
-from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
-from .._exceptions import ProxyError
+from .._backends.base import (
+    SOCKET_OPTION,
+    AsyncNetworkBackend,
+    AsyncNetworkStream,
+)
+from .._exceptions import ConnectTimeout, ProxyError, ReadTimeout, WriteTimeout
 from .._models import (
     URL,
     Origin,
@@ -17,7 +23,7 @@ from .._models import (
     enforce_url,
 )
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection import AsyncHTTPConnection
 from .connection_pool import AsyncConnectionPool
@@ -30,6 +36,120 @@ HeadersAsMapping = typing.Mapping[ByteOrStr, ByteOrStr]
 
 
 logger = logging.getLogger("httpcore.proxy")
+
+ProxyAuthCallback = typing.Callable[..., typing.Any]
+
+
+class _DeadlineNetworkStream(AsyncNetworkStream):
+    def __init__(
+        self,
+        stream: AsyncNetworkStream,
+        deadline: float | None,
+        time_func: typing.Callable[[], float],
+    ) -> None:
+        self._stream = stream
+        self._deadline = deadline
+        self._time = time_func
+
+    def _remaining(self, timeout: float | None) -> float | None:
+        if self._deadline is None:
+            return timeout
+        remaining = max(0.0, self._deadline - self._time())
+        if timeout is None:
+            return remaining
+        return min(timeout, remaining)
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        remaining = self._remaining(timeout)
+        if remaining == 0.0:
+            raise ReadTimeout("Timed out")
+        return await self._stream.read(max_bytes, timeout=remaining)
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        remaining = self._remaining(timeout)
+        if remaining == 0.0:
+            raise WriteTimeout("Timed out")
+        await self._stream.write(buffer, timeout=remaining)
+
+    async def aclose(self) -> None:
+        with AsyncShieldCancellation():
+            await self._stream.aclose()
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncNetworkStream:
+        remaining = self._remaining(timeout)
+        if remaining == 0.0:
+            await self.aclose()
+            raise ConnectTimeout("Timed out")
+        try:
+            return await self._stream.start_tls(
+                ssl_context, server_hostname, timeout=remaining
+            )
+        except BaseException:
+            await self.aclose()
+            raise
+
+    def get_extra_info(self, info: str) -> typing.Any:
+        return self._stream.get_extra_info(info)
+
+
+class _DeadlineNetworkBackend(AsyncNetworkBackend):
+    def __init__(
+        self,
+        backend: AsyncNetworkBackend,
+        deadline: float | None,
+        time_func: typing.Callable[[], float],
+    ) -> None:
+        self._backend = backend
+        self._deadline = deadline
+        self._time = time_func
+
+    def _remaining(self, timeout: float | None) -> float | None:
+        if self._deadline is None:
+            return timeout
+        remaining = max(0.0, self._deadline - self._time())
+        if remaining == 0.0:
+            raise ConnectTimeout("Timed out")
+        if timeout is None:
+            return remaining
+        return min(timeout, remaining)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> AsyncNetworkStream:
+        stream = await self._backend.connect_tcp(
+            host,
+            port,
+            timeout=self._remaining(timeout),
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+        return _DeadlineNetworkStream(stream, self._deadline, self._time)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> AsyncNetworkStream:
+        stream = await self._backend.connect_unix_socket(
+            path,
+            timeout=self._remaining(timeout),
+            socket_options=socket_options,
+        )
+        return _DeadlineNetworkStream(stream, self._deadline, self._time)
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
 
 
 def merge_headers(
@@ -51,6 +171,19 @@ def merge_headers(
     return default_headers + override_headers
 
 
+async def _get_proxy_auth_headers(
+    callback: ProxyAuthCallback, response: Response
+) -> list[tuple[bytes, bytes]]:
+    authorization = callback(response)
+    if not inspect.isawaitable(authorization):
+        raise TypeError(
+            "If you're using an asynchronous interface, the proxy authentication "
+            "callback must be an asynchronous function."
+        )
+    authorization = await authorization
+    return enforce_headers(authorization, name="proxy_auth_callback")
+
+
 class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
     """
     A connection pool that sends requests via an HTTP proxy.
@@ -60,6 +193,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         self,
         proxy_url: URL | bytes | str,
         proxy_auth: tuple[bytes | str, bytes | str] | None = None,
+        proxy_auth_callback: ProxyAuthCallback | None = None,
         proxy_headers: HeadersAsMapping | HeadersAsSequence | None = None,
         ssl_context: ssl.SSLContext | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
@@ -82,6 +216,8 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
                 For example `"http://127.0.0.1:8080/"`.
             proxy_auth: Any proxy authentication as a two-tuple of
                 (username, password). May be either bytes or ascii-only str.
+            proxy_auth_callback: A callback invoked once with the proxy
+                authentication challenge. It may return headers to retry with.
             proxy_headers: Any HTTP headers to use for the proxy requests.
                 For example `{"Proxy-Authorization": "Basic <username>:<password>"}`.
             ssl_context: An SSL context to use for verifying connections.
@@ -134,6 +270,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
+        self._proxy_auth_callback = proxy_auth_callback
         if proxy_auth is not None:
             username = enforce_bytes(proxy_auth[0], name="proxy_auth")
             password = enforce_bytes(proxy_auth[1], name="proxy_auth")
@@ -156,6 +293,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         return AsyncTunnelHTTPConnection(
             proxy_origin=self._proxy_url.origin,
             proxy_headers=self._proxy_headers,
+            proxy_auth_callback=self._proxy_auth_callback,
             remote_origin=origin,
             ssl_context=self._ssl_context,
             proxy_ssl_context=self._proxy_ssl_context,
@@ -238,130 +376,192 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
         ssl_context: ssl.SSLContext | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
         proxy_headers: typing.Sequence[tuple[bytes, bytes]] | None = None,
+        proxy_auth_callback: ProxyAuthCallback | None = None,
         keepalive_expiry: float | None = None,
         http1: bool = True,
         http2: bool = False,
         network_backend: AsyncNetworkBackend | None = None,
         socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
     ) -> None:
-        self._connection: AsyncConnectionInterface = AsyncHTTPConnection(
-            origin=proxy_origin,
-            keepalive_expiry=keepalive_expiry,
-            network_backend=network_backend,
-            socket_options=socket_options,
-            ssl_context=proxy_ssl_context,
-        )
+        self._connection: AsyncConnectionInterface | None = None
         self._proxy_origin = proxy_origin
         self._remote_origin = remote_origin
         self._ssl_context = ssl_context
         self._proxy_ssl_context = proxy_ssl_context
         self._proxy_headers = enforce_headers(proxy_headers, name="proxy_headers")
+        self._proxy_auth_callback = proxy_auth_callback
         self._keepalive_expiry = keepalive_expiry
         self._http1 = http1
         self._http2 = http2
         self._connect_lock = AsyncLock()
         self._connected = False
+        self._connect_failed = False
+        self._network_backend = network_backend
+        self._socket_options = socket_options
+        self._proxy_ssl_context = proxy_ssl_context
 
     async def handle_async_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("connect", None)
+        connect_timeouts = {
+            "connect": timeout,
+            "read": timeout,
+            "write": timeout,
+        }
 
         async with self._connect_lock:
             if not self._connected:
                 target = b"%b:%d" % (self._remote_origin.host, self._remote_origin.port)
+                deadline = (
+                    None if timeout is None else time.monotonic() + timeout
+                )
+                network_backend = (
+                    _DeadlineNetworkBackend(
+                        self._network_backend, deadline, time.monotonic
+                    )
+                    if timeout is not None
+                    else self._network_backend
+                )
+                proxy_connection = AsyncHTTPConnection(
+                    origin=self._proxy_origin,
+                    keepalive_expiry=self._keepalive_expiry,
+                    network_backend=network_backend,
+                    socket_options=self._socket_options,
+                    ssl_context=self._proxy_ssl_context,
+                )
+                self._connection = proxy_connection
 
-                connect_url = URL(
-                    scheme=self._proxy_origin.scheme,
-                    host=self._proxy_origin.host,
-                    port=self._proxy_origin.port,
-                    target=target,
-                )
-                connect_headers = merge_headers(
-                    [(b"Host", target), (b"Accept", b"*/*")], self._proxy_headers
-                )
-                connect_request = Request(
-                    method=b"CONNECT",
-                    url=connect_url,
-                    headers=connect_headers,
-                    extensions=request.extensions,
-                )
-                connect_response = await self._connection.handle_async_request(
-                    connect_request
-                )
+                try:
+                    connect_url = URL(
+                        scheme=self._proxy_origin.scheme,
+                        host=self._proxy_origin.host,
+                        port=self._proxy_origin.port,
+                        target=target,
+                    )
+                    connect_headers = merge_headers(
+                        [(b"Host", target), (b"Accept", b"*/*")],
+                        self._proxy_headers,
+                    )
+                    auth_callback = request.extensions.get(
+                        "proxy_auth_callback", self._proxy_auth_callback
+                    )
+                    authenticated = False
 
-                if connect_response.status < 200 or connect_response.status > 299:
-                    reason_bytes = connect_response.extensions.get("reason_phrase", b"")
-                    reason_str = reason_bytes.decode("ascii", errors="ignore")
-                    msg = "%d %s" % (connect_response.status, reason_str)
+                    while True:
+                        connect_request = Request(
+                            method=b"CONNECT",
+                            url=connect_url,
+                            headers=connect_headers,
+                            extensions={
+                                **request.extensions,
+                                "timeout": connect_timeouts,
+                            },
+                        )
+                        connect_response = await proxy_connection.handle_async_request(
+                            connect_request
+                        )
+
+                        if 200 <= connect_response.status < 300:
+                            break
+
+                        await connect_response.aread()
+                        if (
+                            connect_response.status == 407
+                            and auth_callback is not None
+                            and not authenticated
+                        ):
+                            authorization_headers = await _get_proxy_auth_headers(
+                                auth_callback, connect_response
+                            )
+                            connect_headers = merge_headers(
+                                connect_headers, authorization_headers
+                            )
+                            authenticated = True
+                            await connect_response.aclose()
+                            continue
+
+                        reason_bytes = connect_response.extensions.get(
+                            "reason_phrase", b""
+                        )
+                        reason_str = reason_bytes.decode("ascii", errors="ignore")
+                        msg = "%d %s" % (connect_response.status, reason_str)
+                        await connect_response.aclose()
+                        await proxy_connection.aclose()
+                        raise ProxyError(msg)
+
+                    stream = connect_response.extensions["network_stream"]
+
+                    # Upgrade the stream to SSL
+                    ssl_context = (
+                        default_ssl_context()
+                        if self._ssl_context is None
+                        else self._ssl_context
+                    )
+                    alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
+                    ssl_context.set_alpn_protocols(alpn_protocols)
+
+                    kwargs = {
+                        "ssl_context": ssl_context,
+                        "server_hostname": self._remote_origin.host.decode("ascii"),
+                        "timeout": timeout,
+                    }
+                    async with Trace("start_tls", logger, request, kwargs) as trace:
+                        stream = await stream.start_tls(**kwargs)
+                        trace.return_value = stream
+
+                    # Determine if we should be using HTTP/1.1 or HTTP/2
+                    ssl_object = stream.get_extra_info("ssl_object")
+                    http2_negotiated = (
+                        ssl_object is not None
+                        and ssl_object.selected_alpn_protocol() == "h2"
+                    )
+
+                    # Create the HTTP/1.1 or HTTP/2 connection
+                    if http2_negotiated or (self._http2 and not self._http1):
+                        from .http2 import AsyncHTTP2Connection
+
+                        self._connection = AsyncHTTP2Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+                    else:
+                        self._connection = AsyncHTTP11Connection(
+                            origin=self._remote_origin,
+                            stream=stream,
+                            keepalive_expiry=self._keepalive_expiry,
+                        )
+
+                    self._connected = True
+                except BaseException:
+                    self._connect_failed = True
                     await self._connection.aclose()
-                    raise ProxyError(msg)
-
-                stream = connect_response.extensions["network_stream"]
-
-                # Upgrade the stream to SSL
-                ssl_context = (
-                    default_ssl_context()
-                    if self._ssl_context is None
-                    else self._ssl_context
-                )
-                alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
-                ssl_context.set_alpn_protocols(alpn_protocols)
-
-                kwargs = {
-                    "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": timeout,
-                }
-                async with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = await stream.start_tls(**kwargs)
-                    trace.return_value = stream
-
-                # Determine if we should be using HTTP/1.1 or HTTP/2
-                ssl_object = stream.get_extra_info("ssl_object")
-                http2_negotiated = (
-                    ssl_object is not None
-                    and ssl_object.selected_alpn_protocol() == "h2"
-                )
-
-                # Create the HTTP/1.1 or HTTP/2 connection
-                if http2_negotiated or (self._http2 and not self._http1):
-                    from .http2 import AsyncHTTP2Connection
-
-                    self._connection = AsyncHTTP2Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
-                    )
-                else:
-                    self._connection = AsyncHTTP11Connection(
-                        origin=self._remote_origin,
-                        stream=stream,
-                        keepalive_expiry=self._keepalive_expiry,
-                    )
-
-                self._connected = True
+                    raise
         return await self._connection.handle_async_request(request)
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._remote_origin
 
     async def aclose(self) -> None:
-        await self._connection.aclose()
+        if self._connection is not None:
+            await self._connection.aclose()
 
     def info(self) -> str:
+        if self._connection is None:
+            return "CONNECTION FAILED" if self._connect_failed else "CONNECTING"
         return self._connection.info()
 
     def is_available(self) -> bool:
-        return self._connection.is_available()
+        return False if self._connection is None else self._connection.is_available()
 
     def has_expired(self) -> bool:
-        return self._connection.has_expired()
+        return self._connect_failed if self._connection is None else self._connection.has_expired()
 
     def is_idle(self) -> bool:
-        return self._connection.is_idle()
+        return False if self._connection is None else self._connection.is_idle()
 
     def is_closed(self) -> bool:
-        return self._connection.is_closed()
+        return self._connect_failed if self._connection is None else self._connection.is_closed()
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} [{self.info()}]>"

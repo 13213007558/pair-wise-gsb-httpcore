@@ -156,6 +156,7 @@ class ConnectionPool(RequestInterface):
             return TunnelHTTPConnection(
                 proxy_origin=self._proxy.url.origin,
                 proxy_headers=self._proxy.headers,
+                proxy_auth_callback=self._proxy.auth_callback,
                 proxy_ssl_context=self._proxy.ssl_context,
                 remote_origin=origin,
                 ssl_context=self._ssl_context,
