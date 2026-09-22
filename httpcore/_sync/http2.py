@@ -60,6 +60,7 @@ class HTTP2Connection(ConnectionInterface):
         self._state_lock = Lock()
         self._read_lock = Lock()
         self._write_lock = Lock()
+        self._close_lock = Lock()
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
@@ -410,7 +411,9 @@ class HTTP2Connection(ConnectionInterface):
         self._max_streams_semaphore.release()
         del self._events[stream_id]
         with self._state_lock:
-            if self._connection_terminated and not self._events:
+            if (
+                self._connection_error or self._connection_terminated
+            ) and not self._events:
                 self.close()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
@@ -424,9 +427,12 @@ class HTTP2Connection(ConnectionInterface):
     def close(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
-        self._h2_state.close_connection()
-        self._state = HTTPConnectionState.CLOSED
-        self._network_stream.close()
+        with self._close_lock:
+            if self._state == HTTPConnectionState.CLOSED:
+                return
+            self._h2_state.close_connection()
+            self._state = HTTPConnectionState.CLOSED
+            self._network_stream.close()
 
     # Wrappers around network read/write operations...
 
@@ -577,11 +583,11 @@ class HTTP2ConnectionByteStream:
                 ):
                     yield chunk
         except BaseException as exc:
-            # If we get an exception while streaming the response,
-            # we want to close the response (and possibly the connection)
-            # before raising that exception.
-            with ShieldCancellation():
-                self.close()
+            try:
+                with ShieldCancellation():
+                    self.close()
+            except BaseException:
+                pass
             raise exc
 
     def close(self) -> None:

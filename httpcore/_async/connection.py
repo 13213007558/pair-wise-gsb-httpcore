@@ -63,6 +63,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         )
         self._connection: AsyncConnectionInterface | None = None
         self._connect_failed: bool = False
+        self._closed = False
         self._request_lock = AsyncLock()
         self._socket_options = socket_options
 
@@ -168,7 +169,8 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         return origin == self._origin
 
     async def aclose(self) -> None:
-        if self._connection is not None:
+        if self._connection is not None and not self._closed:
+            self._closed = True
             async with Trace("close", logger, None, {}):
                 await self._connection.aclose()
 

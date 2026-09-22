@@ -253,7 +253,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 closing = self._assign_requests_to_connections()
 
             await self._close_connections(closing)
-            raise exc from None
+            raise exc
 
         # Return the response. Note that in this case we still have to manage
         # the point at which the response is closed.
@@ -403,18 +403,27 @@ class PoolByteStream:
             async for part in self._stream:
                 yield part
         except BaseException as exc:
-            await self.aclose()
-            raise exc from None
+            try:
+                await self.aclose()
+            except BaseException:
+                pass
+            raise exc
 
     async def aclose(self) -> None:
         if not self._closed:
             self._closed = True
-            with AsyncShieldCancellation():
-                if hasattr(self._stream, "aclose"):
-                    await self._stream.aclose()
+            stream_close_error: BaseException | None = None
+            try:
+                with AsyncShieldCancellation():
+                    if hasattr(self._stream, "aclose"):
+                        await self._stream.aclose()
+            except BaseException as exc:
+                stream_close_error = exc
 
             with self._pool._optional_thread_lock:
                 self._pool._requests.remove(self._pool_request)
                 closing = self._pool._assign_requests_to_connections()
 
             await self._pool._close_connections(closing)
+            if stream_close_error is not None:
+                raise stream_close_error

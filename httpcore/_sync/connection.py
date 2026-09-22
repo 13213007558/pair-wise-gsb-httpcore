@@ -63,6 +63,7 @@ class HTTPConnection(ConnectionInterface):
         )
         self._connection: ConnectionInterface | None = None
         self._connect_failed: bool = False
+        self._closed = False
         self._request_lock = Lock()
         self._socket_options = socket_options
 
@@ -168,7 +169,8 @@ class HTTPConnection(ConnectionInterface):
         return origin == self._origin
 
     def close(self) -> None:
-        if self._connection is not None:
+        if self._connection is not None and not self._closed:
+            self._closed = True
             with Trace("close", logger, None, {}):
                 self._connection.close()
 

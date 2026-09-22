@@ -56,6 +56,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
         self._state_lock = AsyncLock()
+        self._close_lock = AsyncLock()
         self._request_count = 0
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
@@ -254,8 +255,11 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
     async def aclose(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
-        self._state = HTTPConnectionState.CLOSED
-        await self._network_stream.aclose()
+        async with self._close_lock:
+            if self._state == HTTPConnectionState.CLOSED:
+                return
+            self._state = HTTPConnectionState.CLOSED
+            await self._network_stream.aclose()
 
     # The AsyncConnectionInterface methods provide information about the state of
     # the connection, allowing for a connection pooling implementation to
@@ -334,11 +338,11 @@ class HTTP11ConnectionByteStream:
                 async for chunk in self._connection._receive_response_body(**kwargs):
                     yield chunk
         except BaseException as exc:
-            # If we get an exception while streaming the response,
-            # we want to close the response (and possibly the connection)
-            # before raising that exception.
-            with AsyncShieldCancellation():
-                await self.aclose()
+            try:
+                with AsyncShieldCancellation():
+                    await self.aclose()
+            except BaseException:
+                pass
             raise exc
 
     async def aclose(self) -> None:

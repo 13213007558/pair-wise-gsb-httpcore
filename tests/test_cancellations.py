@@ -68,6 +68,26 @@ class SlowReadStream(httpcore.AsyncNetworkStream):
         await anyio.sleep(0)
 
 
+class FragmentedSlowReadStream(httpcore.AsyncNetworkStream):
+    def __init__(self, buffer: typing.List[bytes]) -> None:
+        self._buffer = buffer
+        self.read_gate = anyio.Event()
+        self.close_count = 0
+
+    async def write(self, buffer, timeout=None):
+        pass
+
+    async def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        if len(self._buffer) == 1:
+            await self.read_gate.wait()
+        return self._buffer.pop(0)
+
+    async def aclose(self):
+        self.close_count += 1
+
+
 class SlowWriteBackend(httpcore.AsyncNetworkBackend):
     async def connect_tcp(
         self,
@@ -171,7 +191,27 @@ async def test_h11_timeout_during_response():
         assert conn.is_closed()
 
 
-@pytest.mark.xfail
+@pytest.mark.anyio
+async def test_h11_async_generator_cancellation_closes_response():
+    origin = httpcore.Origin(b"http", b"example.com", 80)
+    stream = FragmentedSlowReadStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 1000\r\n",
+            b"\r\n",
+            b"Hello, world!...",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin, stream) as conn:
+        with pytest.raises(TimeoutError):
+            with anyio.fail_after(0.05):
+                await conn.request("GET", "http://example.com")
+
+        assert conn.is_closed()
+        assert stream.close_count == 1
+        stream.read_gate.set()
+
+
 @pytest.mark.anyio
 async def test_h2_timeout_during_handshake():
     """
@@ -186,7 +226,6 @@ async def test_h2_timeout_during_handshake():
         assert conn.is_closed()
 
 
-@pytest.mark.xfail
 @pytest.mark.anyio
 async def test_h2_timeout_during_request():
     """
@@ -207,7 +246,6 @@ async def test_h2_timeout_during_request():
         assert conn.is_idle()
 
 
-@pytest.mark.xfail
 @pytest.mark.anyio
 async def test_h2_timeout_during_response():
     """

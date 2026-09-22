@@ -253,7 +253,7 @@ class ConnectionPool(RequestInterface):
                 closing = self._assign_requests_to_connections()
 
             self._close_connections(closing)
-            raise exc from None
+            raise exc
 
         # Return the response. Note that in this case we still have to manage
         # the point at which the response is closed.
@@ -403,18 +403,27 @@ class PoolByteStream:
             for part in self._stream:
                 yield part
         except BaseException as exc:
-            self.close()
-            raise exc from None
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise exc
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            with ShieldCancellation():
-                if hasattr(self._stream, "close"):
-                    self._stream.close()
+            stream_close_error: BaseException | None = None
+            try:
+                with ShieldCancellation():
+                    if hasattr(self._stream, "close"):
+                        self._stream.close()
+            except BaseException as exc:
+                stream_close_error = exc
 
             with self._pool._optional_thread_lock:
                 self._pool._requests.remove(self._pool_request)
                 closing = self._pool._assign_requests_to_connections()
 
             self._pool._close_connections(closing)
+            if stream_close_error is not None:
+                raise stream_close_error

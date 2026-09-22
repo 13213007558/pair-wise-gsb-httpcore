@@ -60,6 +60,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         self._state_lock = AsyncLock()
         self._read_lock = AsyncLock()
         self._write_lock = AsyncLock()
+        self._close_lock = AsyncLock()
         self._sent_connection_init = False
         self._used_all_stream_ids = False
         self._connection_error = False
@@ -410,7 +411,9 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         await self._max_streams_semaphore.release()
         del self._events[stream_id]
         async with self._state_lock:
-            if self._connection_terminated and not self._events:
+            if (
+                self._connection_error or self._connection_terminated
+            ) and not self._events:
                 await self.aclose()
 
             elif self._state == HTTPConnectionState.ACTIVE and not self._events:
@@ -424,9 +427,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
     async def aclose(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
-        self._h2_state.close_connection()
-        self._state = HTTPConnectionState.CLOSED
-        await self._network_stream.aclose()
+        async with self._close_lock:
+            if self._state == HTTPConnectionState.CLOSED:
+                return
+            self._h2_state.close_connection()
+            self._state = HTTPConnectionState.CLOSED
+            await self._network_stream.aclose()
 
     # Wrappers around network read/write operations...
 
@@ -577,11 +583,11 @@ class HTTP2ConnectionByteStream:
                 ):
                     yield chunk
         except BaseException as exc:
-            # If we get an exception while streaming the response,
-            # we want to close the response (and possibly the connection)
-            # before raising that exception.
-            with AsyncShieldCancellation():
-                await self.aclose()
+            try:
+                with AsyncShieldCancellation():
+                    await self.aclose()
+            except BaseException:
+                pass
             raise exc
 
     async def aclose(self) -> None:

@@ -56,6 +56,7 @@ class HTTP11Connection(ConnectionInterface):
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
         self._state_lock = Lock()
+        self._close_lock = Lock()
         self._request_count = 0
         self._h11_state = h11.Connection(
             our_role=h11.CLIENT,
@@ -254,8 +255,11 @@ class HTTP11Connection(ConnectionInterface):
     def close(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
-        self._state = HTTPConnectionState.CLOSED
-        self._network_stream.close()
+        with self._close_lock:
+            if self._state == HTTPConnectionState.CLOSED:
+                return
+            self._state = HTTPConnectionState.CLOSED
+            self._network_stream.close()
 
     # The ConnectionInterface methods provide information about the state of
     # the connection, allowing for a connection pooling implementation to
@@ -334,11 +338,11 @@ class HTTP11ConnectionByteStream:
                 for chunk in self._connection._receive_response_body(**kwargs):
                     yield chunk
         except BaseException as exc:
-            # If we get an exception while streaming the response,
-            # we want to close the response (and possibly the connection)
-            # before raising that exception.
-            with ShieldCancellation():
-                self.close()
+            try:
+                with ShieldCancellation():
+                    self.close()
+            except BaseException:
+                pass
             raise exc
 
     def close(self) -> None:

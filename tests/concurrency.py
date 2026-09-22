@@ -9,7 +9,9 @@ We don't do any smarts around cancellations, or managing exceptions from
 childen, because we don't need that for our use-case.
 """
 
+import contextlib
 import threading
+import time
 from types import TracebackType
 from typing import Any, Callable, List, Optional, Type
 
@@ -37,5 +39,37 @@ class Nursery:
         self._threads.append(thread)
 
 
+class ImmediateNursery(Nursery):
+    def start_soon(self, func: Callable[..., object], *args: Any) -> None:
+        thread = threading.Thread(target=func, args=args)
+        self._threads.append(thread)
+        thread.start()
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]] = None,
+        exc_value: Optional[BaseException] = None,
+        traceback: Optional[TracebackType] = None,
+    ) -> None:
+        for thread in self._threads:
+            thread.join()
+
+
 def open_nursery() -> Nursery:
     return Nursery()
+
+
+def create_task_group() -> ImmediateNursery:
+    return ImmediateNursery()
+
+
+Event = threading.Event
+
+
+def wait_all_tasks_blocked() -> None:
+    time.sleep(0.01)
+
+
+@contextlib.contextmanager
+def fail_after(seconds: float):
+    yield
