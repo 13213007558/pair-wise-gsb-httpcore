@@ -1,12 +1,81 @@
 import logging
 import typing
 
+import h11
 import hpack
 import hyperframe.frame
 import pytest
 from tests import concurrency
 
 import httpcore
+
+
+class FragmentedMockStream(httpcore.MockStream):
+    """
+    A mock stream that fragments the buffered response into small reads,
+    and records how many times it has been closed.
+    """
+
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        http2: bool = False,
+        fragment_size: int = 3,
+    ) -> None:
+        super().__init__(buffer, http2)
+        self._fragment_size = fragment_size
+        self.close_count = 0
+
+    def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        if self._closed or not self._buffer:
+            return super().read(max_bytes, timeout)
+        fragment = self._buffer[0][: self._fragment_size]
+        remainder = self._buffer[0][self._fragment_size :]
+        if remainder:
+            self._buffer[0] = remainder
+        else:
+            self._buffer.pop(0)
+        return fragment
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+
+class FragmentedMockBackend(httpcore.MockBackend):
+    """
+    A mock backend that hands out a fragmented stream per connection,
+    using a separate response buffer for each new connection, and
+    recording every stream it creates.
+    """
+
+    def __init__(
+        self,
+        buffers: typing.List[typing.List[bytes]],
+        http2: bool = False,
+        fragment_size: int = 3,
+    ) -> None:
+        super().__init__([], http2)
+        self._buffers = buffers
+        self._fragment_size = fragment_size
+        self.streams: typing.List[FragmentedMockStream] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> httpcore.MockStream:
+        buffer = self._buffers[len(self.streams)]
+        stream = FragmentedMockStream(
+            list(buffer), http2=self._http2, fragment_size=self._fragment_size
+        )
+        self.streams.append(stream)
+        return stream
 
 
 
@@ -835,3 +904,376 @@ def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+
+def test_connection_pool_with_truncated_content_length():
+    """
+    A keep-alive response that truncates a 'Content-Length' body must
+    surface the protocol error to the caller, and the broken connection
+    must be discarded rather than returned to the pool as keep-alive.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [  # First connection: the body is shorter than 'Content-Length'.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello,",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        # The caller sees the original protocol error while reading the body.
+        with pool.stream("GET", "http://example.com/") as response:
+            assert response.status == 200
+            with pytest.raises(httpcore.RemoteProtocolError) as exc_info:
+                response.read()
+
+        exc = exc_info.value
+        assert str(exc) == (
+            "peer closed connection without sending complete message body "
+            "(received 6 bytes, expected 13)"
+        )
+        # The raw 'h11' protocol error is preserved in the exception chain.
+        assert exc.__cause__ is None
+        assert exc.__suppress_context__
+        assert isinstance(exc.__context__, h11.RemoteProtocolError)
+
+        # The broken connection was closed exactly once, and discarded
+        # from the pool instead of being returned as keep-alive.
+        assert network_backend.streams[0].close_count == 1
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 0 idle]>"
+        )
+
+        # A follow-up request is eligible for a fresh connection.
+        response = pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 1 idle]>"
+        )
+
+
+
+def test_connection_pool_with_truncated_chunked_body():
+    """
+    A chunked response that disconnects before the terminating chunk must
+    surface the protocol error to the caller, and the broken connection
+    must be discarded from the pool.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [  # First connection: no terminating "0\r\n\r\n" chunk.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Transfer-Encoding: chunked\r\n",
+                b"\r\n",
+                b"5\r\nHello\r\n",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream("GET", "http://example.com/") as response:
+            assert response.status == 200
+            chunks = []
+            with pytest.raises(httpcore.RemoteProtocolError) as exc_info:
+                for part in response.iter_stream():
+                    chunks.append(part)
+
+        # The complete chunks are delivered before the error is raised.
+        assert b"".join(chunks) == b"Hello"
+        exc = exc_info.value
+        assert "incomplete chunked read" in str(exc)
+        assert isinstance(exc.__context__, h11.RemoteProtocolError)
+
+        # The broken connection was closed exactly once, and discarded.
+        assert network_backend.streams[0].close_count == 1
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 0 idle]>"
+        )
+
+        # A follow-up request is eligible for a fresh connection.
+        response = pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+
+
+
+def test_connection_pool_with_invalid_chunk():
+    """
+    A chunked response including an invalid chunk header must surface
+    the protocol error to the caller, and the broken connection must be
+    discarded from the pool.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [  # First connection: an invalid chunk header.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Transfer-Encoding: chunked\r\n",
+                b"\r\n",
+                b"5\r\nHello\r\n",
+                b"ZZZ\r\n",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream("GET", "http://example.com/") as response:
+            assert response.status == 200
+            chunks = []
+            with pytest.raises(httpcore.RemoteProtocolError) as exc_info:
+                for part in response.iter_stream():
+                    chunks.append(part)
+
+        assert b"".join(chunks) == b"Hello"
+        exc = exc_info.value
+        assert "illegal chunk header" in str(exc)
+        assert isinstance(exc.__context__, h11.RemoteProtocolError)
+
+        # The broken connection was closed exactly once, and discarded.
+        assert network_backend.streams[0].close_count == 1
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 0 idle]>"
+        )
+
+        # A follow-up request is eligible for a fresh connection.
+        response = pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+
+
+
+def test_connection_pool_response_close_is_idempotent():
+    """
+    Closing a response before a protocol error would surface must be
+    idempotent, and must not affect other in-flight requests that are
+    using healthy connections on the same pool.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [  # First connection: the body is shorter than 'Content-Length'.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello,",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        with pool.stream(
+            "GET", "http://example.com/"
+        ) as broken_response, pool.stream(
+            "GET", "http://other.com/"
+        ) as healthy_response:
+            # The caller closes the broken response before reading the body,
+            # so the protocol error never surfaces. Closing is idempotent,
+            # and racing against the context manager close is allowed.
+            broken_response.close()
+            broken_response.close()
+            # Other in-flight requests on the pool are unaffected.
+            healthy_response.read()
+
+        assert healthy_response.status == 200
+        assert healthy_response.content == b"Hello, world!"
+
+        # The broken connection was closed exactly once, and discarded.
+        assert network_backend.streams[0].close_count == 1
+        # The healthy connection was not closed, and remains in the pool.
+        assert network_backend.streams[1].close_count == 0
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 1 idle]>"
+        )
+
+
+
+def test_connection_pool_protocol_error_wakes_queued_requests():
+    """
+    When a response fails with a protocol error on a full connection pool,
+    the broken connection must be discarded, and any requests queued
+    waiting for a connection must be woken up and retried on a fresh
+    connection.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [  # First connection: the body is shorter than 'Content-Length'.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello,",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    def fetch_broken(pool, protocol_errors):
+        with pool.stream("GET", "http://example.com/") as response:
+            # Wait until the queued request is waiting on the full pool.
+            for _ in range(1000):
+                if "1 queued" in repr(pool):
+                    break
+                concurrency.sleep(0.001)
+            assert "1 queued" in repr(pool)
+            with pytest.raises(httpcore.RemoteProtocolError) as exc_info:
+                response.read()
+            protocol_errors.append(exc_info.value)
+
+    def fetch_queued(pool, responses):
+        # Wait until the first request is holding the only connection.
+        for _ in range(1000):
+            if "1 active" in repr(pool):
+                break
+            concurrency.sleep(0.001)
+        response = pool.request("GET", "http://example.com/")
+        responses.append(response)
+
+    with httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1
+    ) as pool:
+        protocol_errors: typing.List[httpcore.RemoteProtocolError] = []
+        responses: typing.List[httpcore.Response] = []
+        with concurrency.open_nursery() as nursery:
+            nursery.start_soon(fetch_broken, pool, protocol_errors)
+            nursery.start_soon(fetch_queued, pool, responses)
+
+        # The first request saw the protocol error...
+        assert len(protocol_errors) == 1
+        assert isinstance(protocol_errors[0].__context__, h11.RemoteProtocolError)
+        # ...and the queued request was woken up and retried
+        # on a fresh connection.
+        assert len(responses) == 1
+        assert responses[0].status == 200
+        assert responses[0].content == b"Hello, world!"
+
+        # The broken connection was closed exactly once, and discarded.
+        # The new connection remains idle in the pool.
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[0].close_count == 1
+        assert network_backend.streams[1].close_count == 0
+        assert (
+            repr(pool) == "<ConnectionPool [Requests: 0 active, 0 queued"
+            " | Connections: 0 active, 1 idle]>"
+        )
+
+
+
+def test_connection_pool_with_http2_stream_reset():
+    """
+    An HTTP/2 stream that is reset by the server mid-body must surface
+    a protocol error to the caller, while the connection itself remains
+    healthy and reusable for other requests.
+    """
+    network_backend = FragmentedMockBackend(
+        [
+            [
+                hyperframe.frame.SettingsFrame().serialize(),
+                hyperframe.frame.HeadersFrame(
+                    stream_id=1,
+                    data=hpack.Encoder().encode(
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"plain/text"),
+                        ]
+                    ),
+                    flags=["END_HEADERS"],
+                ).serialize(),
+                hyperframe.frame.DataFrame(stream_id=1, data=b"Hello").serialize(),
+                hyperframe.frame.RstStreamFrame(stream_id=1, error_code=8).serialize(),
+                hyperframe.frame.HeadersFrame(
+                    stream_id=3,
+                    data=hpack.Encoder().encode(
+                        [
+                            (b":status", b"200"),
+                            (b"content-type", b"plain/text"),
+                        ]
+                    ),
+                    flags=["END_HEADERS"],
+                ).serialize(),
+                hyperframe.frame.DataFrame(
+                    stream_id=3, data=b"Hello, world!", flags=["END_STREAM"]
+                ).serialize(),
+            ]
+        ],
+        http2=True,
+        fragment_size=7,
+    )
+
+    with httpcore.ConnectionPool(network_backend=network_backend) as pool:
+        # The caller sees a protocol error when the stream is reset.
+        with pool.stream("GET", "https://example.com/") as response:
+            assert response.status == 200
+            with pytest.raises(httpcore.RemoteProtocolError) as exc_info:
+                response.read()
+
+        exc = exc_info.value
+        assert exc.args[0].stream_id == 1
+        assert exc.args[0].error_code == 8
+        assert exc.__context__ is None
+
+        # The connection itself is healthy: it was not closed,
+        # and remains idle in the pool.
+        assert network_backend.streams[0].close_count == 0
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<HTTPConnection ['https://example.com:443', HTTP/2, IDLE, Request Count: 1]>"
+        ]
+
+        # A follow-up request reuses the same healthy connection.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 1
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<HTTPConnection ['https://example.com:443', HTTP/2, IDLE, Request Count: 2]>"
+        ]

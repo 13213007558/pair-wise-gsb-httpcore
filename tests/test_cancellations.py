@@ -95,6 +95,61 @@ class SlowReadBackend(httpcore.AsyncNetworkBackend):
         return SlowReadStream(self._buffer)
 
 
+class FragmentedSlowReadStream(httpcore.AsyncMockStream):
+    """
+    A mock stream that fragments its reads, blocks once the buffer is
+    exhausted, and records how many times it has been closed.
+    """
+
+    def __init__(self, buffer: typing.List[bytes], fragment_size: int = 3):
+        super().__init__(buffer)
+        self._fragment_size = fragment_size
+        self.close_count = 0
+
+    async def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        if self._closed:
+            raise httpcore.ReadError("Connection closed")
+        if not self._buffer:
+            await anyio.sleep(999)
+        fragment = self._buffer[0][: self._fragment_size]
+        remainder = self._buffer[0][self._fragment_size :]
+        if remainder:
+            self._buffer[0] = remainder
+        else:
+            self._buffer.pop(0)
+        return fragment
+
+    async def aclose(self) -> None:
+        self.close_count += 1
+        await super().aclose()
+
+
+class FragmentedSlowReadBackend(httpcore.AsyncNetworkBackend):
+    """
+    A mock backend that hands out a fragmented slow-read stream per
+    connection, using a separate response buffer for each new connection,
+    and recording every stream it creates.
+    """
+
+    def __init__(self, buffers: typing.List[typing.List[bytes]]):
+        self._buffers = buffers
+        self.streams: typing.List[FragmentedSlowReadStream] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> httpcore.AsyncNetworkStream:
+        stream = FragmentedSlowReadStream(list(self._buffers[len(self.streams)]))
+        self.streams.append(stream)
+        return stream
+
+
 @pytest.mark.anyio
 async def test_connection_pool_timeout_during_request():
     """
@@ -205,6 +260,48 @@ async def test_h2_timeout_during_request():
 
         assert not conn.is_closed()
         assert conn.is_idle()
+
+
+@pytest.mark.anyio
+async def test_connection_pool_cancellation_during_response_streaming():
+    """
+    Cancelling the response body iteration on a keep-alive connection
+    should close and discard the connection exactly once, and the pool
+    should remain usable for subsequent requests.
+    """
+    network_backend = FragmentedSlowReadBackend(
+        [
+            [  # First connection: stalls partway through the body.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 1000\r\n",
+                b"\r\n",
+                b"Hello, world!...",
+            ],
+            [  # Second connection: a healthy response.
+                b"HTTP/1.1 200 OK\r\n",
+                b"Content-Type: plain/text\r\n",
+                b"Content-Length: 13\r\n",
+                b"\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        with anyio.move_on_after(0.01):
+            async with pool.stream("GET", "http://example.com/") as response:
+                async for part in response.aiter_stream():
+                    pass
+
+        # The cancelled connection was closed exactly once, and discarded.
+        assert network_backend.streams[0].close_count == 1
+        assert not pool.connections
+
+        # The pool remains usable for subsequent requests.
+        response = await pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
 
 
 @pytest.mark.xfail
