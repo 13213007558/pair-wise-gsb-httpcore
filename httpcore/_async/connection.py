@@ -153,7 +153,14 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                         "timeout": timeout,
                     }
                     async with Trace("start_tls", logger, request, kwargs) as trace:
-                        stream = await stream.start_tls(**kwargs)
+                        try:
+                            stream = await stream.start_tls(**kwargs)
+                        except BaseException:
+                            # If the TLS handshake fails, then the underlying
+                            # TCP connection is left in an unknown state, and
+                            # must be closed rather than leaked.
+                            await stream.aclose()
+                            raise
                         trace.return_value = stream
                 return stream
             except (ConnectError, ConnectTimeout):

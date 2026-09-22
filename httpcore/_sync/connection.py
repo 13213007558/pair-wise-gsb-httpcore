@@ -153,7 +153,14 @@ class HTTPConnection(ConnectionInterface):
                         "timeout": timeout,
                     }
                     with Trace("start_tls", logger, request, kwargs) as trace:
-                        stream = stream.start_tls(**kwargs)
+                        try:
+                            stream = stream.start_tls(**kwargs)
+                        except BaseException:
+                            # If the TLS handshake fails, then the underlying
+                            # TCP connection is left in an unknown state, and
+                            # must be closed rather than leaked.
+                            stream.close()
+                            raise
                         trace.return_value = stream
                 return stream
             except (ConnectError, ConnectTimeout):

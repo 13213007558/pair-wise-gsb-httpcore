@@ -313,7 +313,14 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
                     "timeout": timeout,
                 }
                 async with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = await stream.start_tls(**kwargs)
+                    try:
+                        stream = await stream.start_tls(**kwargs)
+                    except BaseException:
+                        # If the TLS handshake fails, then the tunnelled
+                        # connection is left in an unknown state, and must
+                        # be closed rather than leaked.
+                        await self._connection.aclose()
+                        raise
                     trace.return_value = stream
 
                 # Determine if we should be using HTTP/1.1 or HTTP/2

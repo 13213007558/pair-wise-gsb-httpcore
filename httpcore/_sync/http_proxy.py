@@ -313,7 +313,14 @@ class TunnelHTTPConnection(ConnectionInterface):
                     "timeout": timeout,
                 }
                 with Trace("start_tls", logger, request, kwargs) as trace:
-                    stream = stream.start_tls(**kwargs)
+                    try:
+                        stream = stream.start_tls(**kwargs)
+                    except BaseException:
+                        # If the TLS handshake fails, then the tunnelled
+                        # connection is left in an unknown state, and must
+                        # be closed rather than leaked.
+                        self._connection.close()
+                        raise
                     trace.return_value = stream
 
                 # Determine if we should be using HTTP/1.1 or HTTP/2

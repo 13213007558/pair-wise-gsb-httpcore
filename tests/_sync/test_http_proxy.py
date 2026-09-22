@@ -11,6 +11,7 @@ from httpcore import (
     MockBackend,
     MockStream,
     NetworkStream,
+    ConnectError,
     Origin,
     Proxy,
     ProxyError,
@@ -276,3 +277,185 @@ def test_proxy_headers():
     assert proxy.headers == [
         (b"Proxy-Authorization", b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
     ]
+
+
+class FlakyTLSStream(MockStream):
+    """
+    A mock stream that fails the TLS handshake a set number of times
+    before succeeding, and that records how many times it is closed.
+    """
+
+    def __init__(
+        self, backend: "FlakyTLSBackend", buffer: typing.List[bytes], http2: bool
+    ) -> None:
+        super().__init__(buffer, http2=False)
+        self._backend = backend
+        self._alpn_http2 = http2
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: typing.Optional[str] = None,
+        timeout: typing.Optional[float] = None,
+    ) -> NetworkStream:
+        if self._backend.tls_failures > 0:
+            self._backend.tls_failures -= 1
+            raise ConnectError("Simulated TLS handshake failure")
+        # The ALPN protocol is only known once the handshake completes.
+        self._http2 = self._alpn_http2
+        return self
+
+
+class FlakyTLSBackend(MockBackend):
+    """
+    A mock backend returning streams with flaky TLS handshakes.
+
+    The 'http2' argument may be a list, allowing the ALPN protocol that
+    is negotiated to vary across connection attempts.
+    """
+
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        tls_failures: int = 0,
+        http2: typing.Union[bool, typing.List[bool]] = False,
+    ) -> None:
+        super().__init__(buffer)
+        self.tls_failures = tls_failures
+        self._http2_modes = http2 if isinstance(http2, list) else [http2]
+        self.streams: typing.List[FlakyTLSStream] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+    ) -> NetworkStream:
+        index = min(len(self.streams), len(self._http2_modes) - 1)
+        stream = FlakyTLSStream(
+            self, list(self._buffer), http2=self._http2_modes[index]
+        )
+        self.streams.append(stream)
+        return stream
+
+
+class CountingBody:
+    """
+    A non-replayable request body that tracks how often it is consumed.
+    """
+
+    def __init__(self, chunks: typing.List[bytes]) -> None:
+        self._chunks = chunks
+        self.iter_count = 0
+        self.chunks_read = 0
+
+    def stream(self) -> typing.Iterator[bytes]:
+        self.iter_count += 1
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+
+def test_proxy_tunneling_tls_failure():
+    """
+    If the TLS handshake with the remote host fails once a CONNECT tunnel
+    has been established, then the tunnelled connection is closed, and a
+    later request reconnects over a fresh tunnel.
+    """
+    network_backend = FlakyTLSBackend(
+        [
+            # The initial response to the proxy CONNECT
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            # The actual response from the remote server
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        tls_failures=1,
+    )
+
+    with ConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        network_backend=network_backend,
+    ) as proxy:
+        body = CountingBody([b"Hello, world!"])
+        with pytest.raises(ConnectError):
+            proxy.request("POST", "https://example.com/", content=body.stream())
+
+        # The failed TLS handshake closed the tunnelled connection, which
+        # was removed from the pool. The request body was never read.
+        assert len(network_backend.streams) == 1
+        assert network_backend.streams[0].close_count == 1
+        assert proxy.connections == []
+        assert body.iter_count == 0
+
+        # A later request reconnects over a fresh tunnel.
+        response = proxy.request("POST", "https://example.com/", content=body.stream())
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[1].close_count == 0
+        assert body.iter_count == 1
+        assert body.chunks_read == 1
+
+
+
+def test_proxy_tunneling_tls_failure_with_alpn_change():
+    """
+    A failed TLS handshake through a proxy tunnel is closed off, and the
+    protocol of a later connection follows the ALPN protocol that is
+    negotiated by the successful handshake.
+    """
+    network_backend = FlakyTLSBackend(
+        [
+            # The initial response to the proxy CONNECT
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            # The actual response from the remote server, over HTTP/2
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ],
+        tls_failures=1,
+        # The failed attempt negotiated 'http/1.1', the successful one 'h2'.
+        http2=[False, True],
+    )
+
+    with ConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        network_backend=network_backend,
+        http2=True,
+    ) as proxy:
+        with pytest.raises(ConnectError):
+            proxy.request("GET", "https://example.com/")
+
+        assert len(network_backend.streams) == 1
+        assert network_backend.streams[0].close_count == 1
+        assert proxy.connections == []
+
+        response = proxy.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.extensions["http_version"] == b"HTTP/2"
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[1].close_count == 0

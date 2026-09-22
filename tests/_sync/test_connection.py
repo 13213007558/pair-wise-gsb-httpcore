@@ -328,6 +328,231 @@ def test_connection_retries():
             conn.request("GET", "https://example.com/")
 
 
+class FlakyTLSStream(MockStream):
+    """
+    A mock stream that fails the TLS handshake a set number of times
+    before succeeding, and that records how many times it is closed.
+    """
+
+    def __init__(
+        self, backend: "FlakyTLSBackend", buffer: typing.List[bytes], http2: bool
+    ) -> None:
+        super().__init__(buffer, http2=False)
+        self._backend = backend
+        self._alpn_http2 = http2
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: typing.Optional[str] = None,
+        timeout: typing.Optional[float] = None,
+    ) -> NetworkStream:
+        if self._backend.tls_failures > 0:
+            self._backend.tls_failures -= 1
+            raise ConnectError("Simulated TLS handshake failure")
+        # The ALPN protocol is only known once the handshake completes.
+        self._http2 = self._alpn_http2
+        return self
+
+
+class FlakyTLSBackend(MockBackend):
+    """
+    A mock backend returning streams with flaky TLS handshakes.
+
+    The 'http2' argument may be a list, allowing the ALPN protocol that
+    is negotiated to vary across connection attempts.
+    """
+
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        tls_failures: int = 0,
+        http2: typing.Union[bool, typing.List[bool]] = False,
+    ) -> None:
+        super().__init__(buffer)
+        self.tls_failures = tls_failures
+        self._http2_modes = http2 if isinstance(http2, list) else [http2]
+        self.streams: typing.List[FlakyTLSStream] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[SOCKET_OPTION]] = None,
+    ) -> NetworkStream:
+        index = min(len(self.streams), len(self._http2_modes) - 1)
+        stream = FlakyTLSStream(
+            self, list(self._buffer), http2=self._http2_modes[index]
+        )
+        self.streams.append(stream)
+        return stream
+
+
+class CountingBody:
+    """
+    A non-replayable request body that tracks how often it is consumed.
+    """
+
+    def __init__(self, chunks: typing.List[bytes]) -> None:
+        self._chunks = chunks
+        self.iter_count = 0
+        self.chunks_read = 0
+
+    def stream(self) -> typing.Iterator[bytes]:
+        self.iter_count += 1
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+
+def test_connection_tls_failure_closes_stream_before_retry():
+    """
+    If the TLS handshake fails then the half-open TCP connection must be
+    closed, and retrying the connection must not re-read a non-replayable
+    request body.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = FlakyTLSBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        tls_failures=2,
+    )
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend, retries=2
+    ) as conn:
+        body = CountingBody([b"Hello, world!"])
+        response = conn.request("POST", "https://example.com/", content=body.stream())
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # Three TCP connections were opened. The TLS handshake failed on the
+        # first two, which were each closed off. The third succeeded and
+        # remains open.
+        assert len(network_backend.streams) == 3
+        assert [stream.close_count for stream in network_backend.streams] == [1, 1, 0]
+
+        # The request body was only read once, on the successful connection.
+        assert body.iter_count == 1
+        assert body.chunks_read == 1
+
+
+
+def test_connection_tls_failure_retries_exhausted():
+    """
+    If the TLS handshake keeps failing then the retry budget is exhausted,
+    every half-open connection is closed, and the request body is never read.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    # More handshake failures than the retry budget allows for.
+    network_backend = FlakyTLSBackend([], tls_failures=3)
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend, retries=2
+    ) as conn:
+        body = CountingBody([b"Hello, world!"])
+        with pytest.raises(ConnectError):
+            conn.request("POST", "https://example.com/", content=body.stream())
+
+        # One initial attempt, plus two retries. Each attempt opened a TCP
+        # connection that was closed when the TLS handshake failed.
+        assert len(network_backend.streams) == 3
+        assert [stream.close_count for stream in network_backend.streams] == [1, 1, 1]
+
+        # The request body was never read, since no connection was established.
+        assert body.iter_count == 0
+        assert body.chunks_read == 0
+
+        assert conn.is_closed()
+        assert not conn.is_available()
+
+
+
+def test_connection_tls_failure_with_alpn_change_to_http2():
+    """
+    The protocol is selected by the ALPN negotiation of the successful
+    TLS handshake, even if earlier attempts negotiated differently.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = FlakyTLSBackend(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ],
+        tls_failures=1,
+        # The failed attempt negotiated 'http/1.1', the successful one 'h2'.
+        http2=[False, True],
+    )
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend, retries=1, http2=True
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.extensions["http_version"] == b"HTTP/2"
+
+        assert len(network_backend.streams) == 2
+        assert [stream.close_count for stream in network_backend.streams] == [1, 0]
+
+
+
+def test_connection_tls_failure_with_alpn_change_to_http11():
+    """
+    The protocol is selected by the ALPN negotiation of the successful
+    TLS handshake, even if earlier attempts negotiated differently.
+    """
+    origin = Origin(b"https", b"example.com", 443)
+    network_backend = FlakyTLSBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        tls_failures=1,
+        # The failed attempt negotiated 'h2', the successful one 'http/1.1'.
+        http2=[True, False],
+    )
+
+    with HTTPConnection(
+        origin=origin, network_backend=network_backend, retries=1, http2=True
+    ) as conn:
+        response = conn.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert response.extensions["http_version"] == b"HTTP/1.1"
+
+        assert len(network_backend.streams) == 2
+        assert [stream.close_count for stream in network_backend.streams] == [1, 0]
+
+
 
 def test_connection_retries_tls():
     origin = Origin(b"https", b"example.com", 443)

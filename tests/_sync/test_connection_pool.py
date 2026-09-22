@@ -835,3 +835,238 @@ def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+class FlakyTLSStream(httpcore.MockStream):
+    """
+    A mock stream that fails the TLS handshake a set number of times
+    before succeeding, and that records how many times it is closed.
+    """
+
+    def __init__(
+        self, backend: "FlakyTLSBackend", buffer: typing.List[bytes]
+    ) -> None:
+        super().__init__(buffer)
+        self._backend = backend
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+        super().close()
+
+    def start_tls(
+        self,
+        ssl_context: typing.Any,
+        server_hostname: typing.Optional[str] = None,
+        timeout: typing.Optional[float] = None,
+    ) -> httpcore.NetworkStream:
+        if self._backend.tls_failures > 0:
+            self._backend.tls_failures -= 1
+            raise self._backend._exc("Simulated TLS handshake failure")
+        return self
+
+
+class FlakyTLSBackend(httpcore.MockBackend):
+    """
+    A mock backend returning streams with flaky TLS handshakes.
+    """
+
+    def __init__(
+        self,
+        buffer: typing.List[bytes],
+        tls_failures: int = 0,
+        exc: typing.Type[Exception] = httpcore.ConnectError,
+    ) -> None:
+        super().__init__(buffer)
+        self.tls_failures = tls_failures
+        self._exc = exc
+        self.streams: typing.List[FlakyTLSStream] = []
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[
+            typing.Iterable[httpcore.SOCKET_OPTION]
+        ] = None,
+    ) -> httpcore.NetworkStream:
+        stream = FlakyTLSStream(self, list(self._buffer))
+        self.streams.append(stream)
+        return stream
+
+
+class CountingBody:
+    """
+    A non-replayable request body that tracks how often it is consumed.
+    """
+
+    def __init__(self, chunks: typing.List[bytes]) -> None:
+        self._chunks = chunks
+        self.iter_count = 0
+        self.chunks_read = 0
+
+    def stream(self) -> typing.Iterator[bytes]:
+        self.iter_count += 1
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+
+def test_connection_pool_concurrent_requests_with_tls_failures():
+    """
+    Concurrent requests to the same origin must not share a connection
+    that is still attempting its TLS handshake. Failed handshakes close
+    the underlying TCP connection, waiters reuse the connection that is
+    eventually established, and each request body is read only once.
+    """
+    network_backend = FlakyTLSBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+        * 5,
+        tls_failures=2,
+    )
+    bodies = [CountingBody([b"Hello, world!"]) for _ in range(5)]
+
+    def fetch(pool, body):
+        with pool.stream(
+            "POST", "https://example.com/", content=body.stream()
+        ) as response:
+            response.read()
+            assert response.status == 200
+
+    with httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1, retries=2
+    ) as pool:
+        with concurrency.open_nursery() as nursery:
+            for body in bodies:
+                nursery.start_soon(fetch, pool, body)
+
+        # A single connection was established, requiring two retries after
+        # failed TLS handshakes. The failed half-open connections were closed.
+        assert len(network_backend.streams) == 3
+        assert [stream.close_count for stream in network_backend.streams] == [1, 1, 0]
+        assert len(pool.connections) == 1
+
+        # Each request body was read exactly once.
+        for body in bodies:
+            assert body.iter_count == 1
+            assert body.chunks_read == 1
+
+
+
+def test_connection_pool_tls_failure_returns_pool_capacity():
+    """
+    A connection that fails its TLS handshake is closed and removed from
+    the pool, so that the pool capacity is returned for later requests.
+    """
+    network_backend = FlakyTLSBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        tls_failures=1,
+    )
+
+    with httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1
+    ) as pool:
+        body = CountingBody([b"Hello, world!"])
+        with pytest.raises(httpcore.ConnectError):
+            pool.request("POST", "https://example.com/", content=body.stream())
+
+        # The failed connection was closed and removed from the pool,
+        # and the request body was never read.
+        assert len(network_backend.streams) == 1
+        assert network_backend.streams[0].close_count == 1
+        assert pool.connections == []
+        assert body.iter_count == 0
+
+        # The pool capacity is returned, so a later request connects afresh.
+        response = pool.request("POST", "https://example.com/", content=body.stream())
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[1].close_count == 0
+        assert body.iter_count == 1
+        assert body.chunks_read == 1
+
+
+
+def test_connection_pool_concurrent_tls_retries_exhausted():
+    """
+    When the retry budget is exhausted, every half-open connection is
+    closed, queued requests do not share the failing connections, and
+    the pool capacity is returned.
+    """
+    network_backend = FlakyTLSBackend([], tls_failures=999)
+    bodies = [CountingBody([b"Hello, world!"]) for _ in range(3)]
+
+    def fetch(pool, body):
+        with pytest.raises(httpcore.ConnectError):
+            pool.request("POST", "https://example.com/", content=body.stream())
+
+    with httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1, retries=1
+    ) as pool:
+        with concurrency.open_nursery() as nursery:
+            for body in bodies:
+                nursery.start_soon(fetch, pool, body)
+
+        # Each of the three requests used one initial attempt plus one retry,
+        # and every half-open connection was closed.
+        assert len(network_backend.streams) == 6
+        assert [stream.close_count for stream in network_backend.streams] == [1] * 6
+        assert pool.connections == []
+
+        # No request body was ever read, since no connection was established.
+        for body in bodies:
+            assert body.iter_count == 0
+            assert body.chunks_read == 0
+
+
+
+def test_connection_pool_tls_timeout_returns_pool_capacity():
+    """
+    A TLS handshake that times out also closes the half-open connection
+    and returns the pool capacity.
+    """
+    network_backend = FlakyTLSBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ],
+        tls_failures=1,
+        exc=httpcore.ConnectTimeout,
+    )
+
+    with httpcore.ConnectionPool(
+        network_backend=network_backend, max_connections=1
+    ) as pool:
+        with pytest.raises(httpcore.ConnectTimeout):
+            pool.request("GET", "https://example.com/")
+
+        # The timed-out connection was closed and removed from the pool.
+        assert len(network_backend.streams) == 1
+        assert network_backend.streams[0].close_count == 1
+        assert pool.connections == []
+
+        # The pool capacity is returned, so a later request connects afresh.
+        response = pool.request("GET", "https://example.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[1].close_count == 0
