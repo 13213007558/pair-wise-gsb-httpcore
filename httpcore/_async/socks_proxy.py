@@ -10,7 +10,7 @@ from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection_pool import AsyncConnectionPool
 from .http11 import AsyncHTTP11Connection
@@ -220,6 +220,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if self._connection is None:
+                stream: AsyncNetworkStream | None = None
                 try:
                     # Connect to the proxy
                     kwargs = {
@@ -290,8 +291,11 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
                         )
-                except Exception as exc:
+                except BaseException as exc:
                     self._connect_failed = True
+                    if stream is not None:
+                        with AsyncShieldCancellation():
+                            await stream.aclose()
                     raise exc
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()
@@ -307,14 +311,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
 
     def is_available(self) -> bool:
         if self._connection is None:  # pragma: nocover
-            # If HTTP/2 support is enabled, and the resulting connection could
-            # end up as HTTP/2 then we should indicate the connection as being
-            # available to service multiple requests.
-            return (
-                self._http2
-                and (self._remote_origin.scheme == b"https" or not self._http1)
-                and not self._connect_failed
-            )
+            return False
         return self._connection.is_available()
 
     def has_expired(self) -> bool:

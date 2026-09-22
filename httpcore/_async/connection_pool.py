@@ -162,6 +162,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 keepalive_expiry=self._keepalive_expiry,
                 http1=self._http1,
                 http2=self._http2,
+                retries=self._retries,
                 network_backend=self._network_backend,
             )
 

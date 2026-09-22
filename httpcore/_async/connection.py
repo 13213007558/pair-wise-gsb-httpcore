@@ -11,7 +11,7 @@ from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStr
 from .._exceptions import ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
@@ -111,6 +111,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 
         while True:
+            stream: AsyncNetworkStream | None = None
             try:
                 if self._uds is None:
                     kwargs = {
@@ -155,14 +156,23 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                     async with Trace("start_tls", logger, request, kwargs) as trace:
                         stream = await stream.start_tls(**kwargs)
                         trace.return_value = stream
+                assert stream is not None
                 return stream
             except (ConnectError, ConnectTimeout):
+                if stream is not None:
+                    with AsyncShieldCancellation():
+                        await stream.aclose()
                 if retries_left <= 0:
                     raise
                 retries_left -= 1
                 delay = next(delays)
                 async with Trace("retry", logger, request, kwargs) as trace:
                     await self._network_backend.sleep(delay)
+            except BaseException:
+                if stream is not None:
+                    with AsyncShieldCancellation():
+                        await stream.aclose()
+                raise
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin
@@ -174,14 +184,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
 
     def is_available(self) -> bool:
         if self._connection is None:
-            # If HTTP/2 support is enabled, and the resulting connection could
-            # end up as HTTP/2 then we should indicate the connection as being
-            # available to service multiple requests.
-            return (
-                self._http2
-                and (self._origin.scheme == b"https" or not self._http1)
-                and not self._connect_failed
-            )
+            return False
         return self._connection.is_available()
 
     def has_expired(self) -> bool:
