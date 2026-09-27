@@ -72,7 +72,7 @@ print(r.extensions["http_version"])
 
 A dictionary of `str: Optional[float]` timeout values.
 
-May include values for `'connect'`, `'read'`, `'write'`, or `'pool'`.
+May include values for `'connect'`, `'read'`, `'write'`, `'pool'`, or `'continue'`.
 
 For example:
 
@@ -85,6 +85,32 @@ r = httpcore.request(
     extensions={"timeout": {"connect": 5.0, "pool": 10.0}}
 )
 ```
+
+The `'continue'` timeout only applies to HTTP/1.1 requests that include an
+`Expect: 100-continue` header. It determines how long the client will wait
+for a `100 Continue` informational response from the server before sending
+the request body anyway. If no `'continue'` timeout is included, then the
+client will wait for a server response indefinitely.
+
+```python
+# Wait at most 1 second for a "100 Continue" response before
+# sending the request body.
+r = httpcore.request(
+    "POST",
+    "https://www.example.com",
+    headers={"Expect": "100-continue"},
+    content=b"...",
+    extensions={"timeout": {"continue": 1.0}}
+)
+```
+
+When a request includes an `Expect: 100-continue` header, the request headers
+are sent first, and the request body is only sent once the server responds with
+a `100 Continue` response, or once the `'continue'` timeout has elapsed.
+The request content is not read at all if the server instead responds directly
+with a final response, such as `417 Expectation Failed`. Other informational
+responses, such as `103 Early Hints`, neither trigger sending the request
+body, nor count as a final response.
 
 ### `"trace"`
 

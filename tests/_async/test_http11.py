@@ -1,6 +1,62 @@
+import typing
+
 import pytest
 
 import httpcore
+
+
+class ExpectContinueStream(httpcore.AsyncNetworkStream):
+    """
+    A controlled byte stream that records all reads and writes, and that
+    replays a scripted sequence of incoming bytes or exceptions.
+
+    This allows tests to verify the exact ordering of outgoing request
+    headers and request body against incoming responses.
+    """
+
+    def __init__(self, script: typing.List[typing.Union[bytes, Exception]]) -> None:
+        self._script = list(script)
+        self.events: typing.List[typing.Tuple[str, typing.Any]] = []
+        self._closed = False
+
+    async def read(
+        self, max_bytes: int, timeout: typing.Optional[float] = None
+    ) -> bytes:
+        if self._closed:
+            raise httpcore.ReadError("Connection closed")
+        self.events.append(("read", timeout))
+        item = self._script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def write(
+        self, buffer: bytes, timeout: typing.Optional[float] = None
+    ) -> None:
+        if self._closed:
+            raise httpcore.WriteError("Connection closed")
+        self.events.append(("write", buffer))
+
+    async def aclose(self) -> None:
+        self._closed = True
+
+
+def written_bytes(stream: ExpectContinueStream) -> typing.List[bytes]:
+    return [data for event, data in stream.events if event == "write"]
+
+
+def body_write_index(stream: ExpectContinueStream, content: bytes) -> int:
+    return next(
+        index
+        for index, (event, data) in enumerate(stream.events)
+        if event == "write" and content in data
+    )
+
+
+def read_indexes(stream: ExpectContinueStream) -> typing.List[int]:
+    return [
+        index for index, (event, data) in enumerate(stream.events) if event == "read"
+    ]
 
 
 @pytest.mark.anyio
@@ -378,3 +434,416 @@ async def test_http11_header_sub_100kb():
         response = await conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_sends_headers_then_body():
+    """
+    Requests including an "Expect: 100-continue" header send the request
+    headers first, and only send the request body once the server has
+    responded with a "100 Continue" informational response.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello, world!",
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # The request headers are sent first, without the request body.
+        writes = written_bytes(stream)
+        assert writes[0].startswith(b"POST / HTTP/1.1\r\n")
+        assert b"Expect: 100-continue" in writes[0]
+        assert b"Hello, world!" not in writes[0]
+
+        # The request body is only sent after reading from the server.
+        assert min(read_indexes(stream)) < body_write_index(stream, b"Hello, world!")
+
+        # The connection is reusable once the response is complete.
+        assert conn.is_idle()
+        assert conn.is_available()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_connection_reuse():
+    """
+    Once a request using "Expect: 100-continue" has completed, the
+    connection is safely reusable for a following request.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 5\r\n",
+            b"\r\n",
+            b"first",
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 6\r\n",
+            b"\r\n",
+            b"second",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello",
+        )
+        assert response.status == 200
+        assert response.content == b"first"
+
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello!",
+        )
+        assert response.status == 200
+        assert response.content == b"second"
+
+        assert conn.is_idle()
+        assert (
+            repr(conn)
+            == "<AsyncHTTP11Connection ['https://example.com:443', IDLE, Request Count: 2]>"
+        )
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_rejected():
+    """
+    If the server responds to "Expect: 100-continue" directly with a final
+    response such as "417 Expectation Failed", then the request body is not
+    sent, and the request content iterator is never read.
+    """
+    content_reads = 0
+
+    async def body() -> typing.AsyncIterator[bytes]:
+        nonlocal content_reads
+        content_reads += 1
+        yield b"Hello, world!"
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 417 Expectation Failed\r\n",
+            b"Content-Length: 0\r\n",
+            b"\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body(),
+        )
+        assert response.status == 417
+
+        # The request content iterator was never read.
+        assert content_reads == 0
+
+        # Only the request headers were sent.
+        writes = written_bytes(stream)
+        assert len(writes) == 1
+        assert b"Hello, world!" not in writes[0]
+
+        # The connection cannot be reused, since the request body was not sent.
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_with_other_informational_responses():
+    """
+    Informational responses other than "100 Continue", such as
+    "103 Early Hints", neither trigger sending the request body,
+    nor count as a final response.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            (
+                b"HTTP/1.1 103 Early Hints\r\n"
+                b"Link: </style.css>; rel=preload; as=style\r\n"
+                b"\r\n"
+            ),
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello, world!",
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # Both the "103 Early Hints" and the "100 Continue" responses were
+        # read before the request body was sent.
+        reads_before_body = [
+            index
+            for index in read_indexes(stream)
+            if index < body_write_index(stream, b"Hello, world!")
+        ]
+        assert len(reads_before_body) == 2
+
+        assert conn.is_idle()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_timeout_fallback():
+    """
+    If no response arrives within the configured "continue" timeout, then
+    the request body is sent anyway. The wait is not treated as a failure.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            httpcore.ReadTimeout("timed out"),
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello, world!",
+            extensions={"timeout": {"continue": 1.0}},
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # The "continue" timeout was applied while waiting for the response.
+        assert ("read", 1.0) in stream.events
+
+        # The request body was sent once the wait had elapsed.
+        writes = written_bytes(stream)
+        assert writes[1] == b"Hello, world!"
+
+        assert conn.is_idle()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_late_response_not_duplicated():
+    """
+    A "100 Continue" response that arrives after the "continue" timeout has
+    already triggered sending the request body must not cause the request
+    body to be sent twice.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            httpcore.ReadTimeout("timed out"),
+            b"HTTP/1.1 100 Continue\r\n",  # A late "100 Continue" response.
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 5\r\n",
+            b"\r\n",
+            b"Hello",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello",
+            extensions={"timeout": {"continue": 1.0}},
+        )
+        assert response.status == 200
+        assert response.content == b"Hello"
+
+        # The request body was sent exactly once.
+        writes = written_bytes(stream)
+        assert writes.count(b"Hello") == 1
+
+        assert conn.is_idle()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_final_response_with_body():
+    """
+    If the server sends a final response including a response body instead of
+    a "100 Continue" response, then the request body is not sent, and the
+    response body can be read as usual.
+    """
+    content_reads = 0
+
+    async def body() -> typing.AsyncIterator[bytes]:
+        nonlocal content_reads
+        content_reads += 1
+        yield b"Hello, world!"
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=body(),
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # The request content iterator was never read.
+        assert content_reads == 0
+
+        # The connection cannot be reused, since the request body was not sent.
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_empty_body():
+    """
+    An empty request body with "Expect: 100-continue" still completes the
+    request/response cycle cleanly, leaving the connection reusable.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 0\r\n",
+            b"\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"",
+        )
+        assert response.status == 200
+        assert response.content == b""
+
+        assert conn.is_idle()
+        assert conn.is_available()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_server_disconnect():
+    """
+    If the server rejects the request and closes the connection while the
+    client is waiting for a "100 Continue" response, then the connection
+    lifecycle ends cleanly.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream([b""])
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(httpcore.RemoteProtocolError):
+            await conn.request(
+                "POST",
+                "https://example.com/",
+                headers={"Expect": "100-continue"},
+                content=b"Hello, world!",
+            )
+
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_http11_expect_100_continue_body_send_error():
+    """
+    If the request content iterator fails while sending the request body,
+    then the connection lifecycle ends cleanly.
+    """
+
+    async def body() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        raise RuntimeError("Something went wrong")
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 100 Continue\r\n",
+            b"\r\n",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Length: 0\r\n",
+            b"\r\n",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        with pytest.raises(RuntimeError):
+            await conn.request(
+                "POST",
+                "https://example.com/",
+                headers={"Expect": "100-continue"},
+                content=body(),
+            )
+
+        assert not conn.is_idle()
+        assert conn.is_closed()
+
+
+@pytest.mark.anyio
+async def test_http11_request_body_sent_immediately_without_expect():
+    """
+    Requests without an "Expect: 100-continue" header send the request body
+    immediately, without waiting for any response from the server.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = ExpectContinueStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            content=b"Hello, world!",
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        # The request body is sent before reading any response.
+        assert body_write_index(stream, b"Hello, world!") < min(read_indexes(stream))
