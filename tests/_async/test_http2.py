@@ -4,6 +4,8 @@ import pytest
 
 import httpcore
 
+from .recording import RecordingStream
+
 
 @pytest.mark.anyio
 async def test_http2_connection():
@@ -380,3 +382,77 @@ async def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+def sent_request_headers(data: bytes) -> list[tuple[bytes, bytes]]:
+    """
+    Return the HTTP/2 request headers sent on the first stream,
+    decoded from the recorded client bytes.
+    """
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    assert data.startswith(preface)
+    data = data[len(preface) :]
+    decoder = hpack.Decoder()
+    headers: list[tuple[bytes, bytes]] = []
+    while data:
+        length = int.from_bytes(data[:3], "big")
+        frame_type = data[3]
+        stream_id = int.from_bytes(data[5:9], "big") & 0x7FFFFFFF
+        payload = data[9 : 9 + length]
+        if frame_type == 0x1 and stream_id == 1:  # HEADERS
+            headers.extend(decoder.decode(payload, raw=True))
+        data = data[9 + length :]
+    return headers
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url,authority,path",
+    [
+        (
+            "http://[fe80::1%25eth0]/path?x=1",
+            b"[fe80::1%25eth0]",
+            b"/path?x=1",
+        ),
+        (
+            "http://[fe80::1%25eth0]:8080/",
+            b"[fe80::1%25eth0]:8080",
+            b"/",
+        ),
+    ],
+)
+async def test_http2_request_with_ipv6_zone_id(url, authority, path):
+    """
+    The HTTP/2 `:authority` pseudo-header uses the bracketed RFC 6874 wire
+    form of the IPv6 address, and `:path` uses the origin-form target.
+    """
+    origin = httpcore.URL(url).origin
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ],
+        http2=True,
+    )
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request("GET", url)
+        assert response.status == 200
+        await response.aread()
+
+    headers = sent_request_headers(stream.written)
+    assert (b":method", b"GET") in headers
+    assert (b":authority", authority) in headers
+    assert (b":scheme", b"http") in headers
+    assert (b":path", path) in headers

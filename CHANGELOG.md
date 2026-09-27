@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Add support for RFC 6874 IPv6 zone identifiers in URLs, such as
+  `http://[fe80::1%25eth0]/`. IPv6 hosts are normalized to their bracketed
+  wire form, keeping the display form, `Host`/HTTP/2 `:authority` headers,
+  absolute proxy request targets, and connection-reuse keys consistent.
+  Invalid authorities now raise a clear `ValueError` when a URL is
+  constructed, rather than failing once a request is sent.
+- Add `httpcore.URL.copy_with()` and `httpcore.URL.join()`.
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
 
 ## Version 1.0.9 (April 24th, 2025)

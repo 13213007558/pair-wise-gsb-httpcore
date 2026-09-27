@@ -53,6 +53,210 @@ def test_url_origin_socks5():
     assert str(origin) == "socks5h://127.0.0.1:1080"
 
 
+# IPv6 zone identifiers (RFC 6874)
+
+
+@pytest.mark.parametrize(
+    "url,host,port,target",
+    [
+        ("http://[fe80::1%25eth0]/", b"[fe80::1%25eth0]", None, "/"),
+        ("http://[fe80::1%25eth0]/path?x=1", b"[fe80::1%25eth0]", None, "/path?x=1"),
+        ("http://[fe80::1%25eth0]:8080/", b"[fe80::1%25eth0]", 8080, "/"),
+        ("http://[fe80::1]/", b"[fe80::1]", None, "/"),
+        ("http://[::1]:8080/path", b"[::1]", 8080, "/path"),
+    ],
+)
+def test_url_ipv6_zone_id(url, host, port, target):
+    """
+    IPv6 literals are normalized to their bracketed RFC 6874 wire form,
+    retaining any percent-encoded zone identifier.
+    """
+    parsed = httpcore.URL(url)
+    assert parsed.scheme == b"http"
+    assert parsed.host == host
+    assert parsed.port == port
+    assert parsed.target == target.encode("ascii")
+
+
+def test_url_ipv6_zone_id_display_form():
+    """
+    The display form of a URL uses the bracketed RFC 6874 wire form,
+    so that it round-trips consistently.
+    """
+    url = httpcore.URL("http://[fe80::1%25eth0]/path?x=1")
+    assert bytes(url) == b"http://[fe80::1%25eth0]/path?x=1"
+    assert httpcore.URL(bytes(url)) == url
+
+    url = httpcore.URL("http://[fe80::1%25eth0]:8080/")
+    assert bytes(url) == b"http://[fe80::1%25eth0]:8080/"
+    assert httpcore.URL(bytes(url)) == url
+
+
+def test_url_ipv6_zone_id_equivalent_constructions():
+    """
+    URLs constructed from a string or from explicit components are
+    normalized to the same canonical form.
+    """
+    url = httpcore.URL("http://[fe80::1%25eth0]/")
+    assert url == httpcore.URL(
+        scheme="http", host="[fe80::1%25eth0]", port=None, target="/"
+    )
+    assert url == httpcore.URL(
+        scheme="http", host="fe80::1%25eth0", port=None, target="/"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[fe80::1%eth0]/",  # Zone identifier requires a '%25' delimiter.
+        "http://[fe80::1%]/",  # Bare '%' delimiter.
+        "http://[fe80::1%25]/",  # Empty zone identifier.
+        "http://[::zz]/",  # Invalid IPv6 address.
+        "http://[::1/",  # Mismatched brackets.
+        "http://example.com:bad/",  # Non-numeric port.
+        "http://example.com:99999/",  # Out-of-range port.
+    ],
+)
+def test_url_with_invalid_authority(url):
+    """
+    Invalid authorities raise a clear error at the point the URL is
+    constructed, rather than failing once a request is sent.
+    """
+    with pytest.raises(ValueError):
+        httpcore.URL(url)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "fe80::1%eth0",  # Zone identifier requires a '%25' delimiter.
+        "fe80::1%25",  # Empty zone identifier.
+        "[fe80::1%25",  # Mismatched brackets.
+        "::zz",  # Invalid IPv6 address.
+    ],
+)
+def test_url_with_invalid_authority_using_explicit_components(host):
+    """
+    Invalid authorities also raise a clear error when the URL is
+    constructed from explicit components.
+    """
+    with pytest.raises(ValueError):
+        httpcore.URL(scheme="http", host=host, port=None, target="/")
+
+
+@pytest.mark.parametrize(
+    "url,other_url,equal",
+    [
+        # The default port may be either implicit or explicit.
+        ("http://[fe80::1%25eth0]/", "http://[fe80::1%25eth0]:80/", True),
+        ("http://[fe80::1%25eth0]:8080/", "http://[fe80::1%25eth0]:8080/", True),
+        # Different zone identifiers must not share connections.
+        ("http://[fe80::1%25eth0]/", "http://[fe80::1%25eth1]/", False),
+        ("http://[fe80::1%25eth0]/", "http://[fe80::1]/", False),
+        # Different explicit ports must not share connections.
+        ("http://[fe80::1%25eth0]/", "http://[fe80::1%25eth0]:8080/", False),
+        ("http://[fe80::1%25eth0]:8080/", "http://[fe80::1%25eth0]:8081/", False),
+        # Different schemes must not share connections.
+        ("http://[fe80::1%25eth0]/", "https://[fe80::1%25eth0]/", False),
+    ],
+)
+def test_url_ipv6_zone_id_connection_reuse_key(url, other_url, equal):
+    """
+    The origin is the connection-reuse key. It must be stable for URLs
+    that are semantically equivalent, and must differ for URLs that
+    differ in zone identifier, port, or scheme.
+    """
+    origin = httpcore.URL(url).origin
+    other_origin = httpcore.URL(other_url).origin
+    assert (origin == other_origin) == equal
+    assert (str(origin) == str(other_origin)) == equal
+
+
+def test_url_ipv6_zone_id_origin():
+    url = httpcore.URL("http://[fe80::1%25eth0]/")
+    origin = url.origin
+    assert origin == httpcore.Origin(b"http", b"[fe80::1%25eth0]", 80)
+    assert str(origin) == "http://[fe80::1%25eth0]:80"
+
+    url = httpcore.URL("https://[fe80::1%25eth0]:8443/")
+    origin = url.origin
+    assert origin == httpcore.Origin(b"https", b"[fe80::1%25eth0]", 8443)
+    assert str(origin) == "https://[fe80::1%25eth0]:8443"
+
+
+@pytest.mark.parametrize(
+    "url,overrides,expected",
+    [
+        (
+            "http://[fe80::1%25eth0]/",
+            {"port": 8080},
+            b"http://[fe80::1%25eth0]:8080/",
+        ),
+        (
+            "http://[fe80::1%25eth0]/",
+            {"target": "/other?x=1"},
+            b"http://[fe80::1%25eth0]/other?x=1",
+        ),
+        (
+            "http://[fe80::1%25eth0]:8080/",
+            {"scheme": "https"},
+            b"https://[fe80::1%25eth0]:8080/",
+        ),
+        (
+            "http://[fe80::1%25eth0]/",
+            {"host": "[fe80::2%25eth0]"},
+            b"http://[fe80::2%25eth0]/",
+        ),
+        (
+            "http://[fe80::1%25eth0]/",
+            {},
+            b"http://[fe80::1%25eth0]/",
+        ),
+    ],
+)
+def test_url_copy_with_ipv6_zone_id(url, overrides, expected):
+    """
+    Copying a URL preserves the canonical RFC 6874 form of the host.
+    """
+    copied = httpcore.URL(url).copy_with(**overrides)
+    assert bytes(copied) == expected
+    assert copied.host.startswith(b"[")
+
+
+@pytest.mark.parametrize(
+    "url,relative,expected",
+    [
+        (
+            "http://[fe80::1%25eth0]/some/path",
+            "../other",
+            b"http://[fe80::1%25eth0]/other",
+        ),
+        (
+            "http://[fe80::1%25eth0]/some/path",
+            "/absolute",
+            b"http://[fe80::1%25eth0]/absolute",
+        ),
+        (
+            "http://[fe80::1%25eth0]:8080/some/path",
+            "other",
+            b"http://[fe80::1%25eth0]:8080/some/other",
+        ),
+        (
+            "http://[fe80::1%25eth0]/some/path",
+            "https://[fe80::2%25eth1]/elsewhere",
+            b"https://[fe80::2%25eth1]/elsewhere",
+        ),
+    ],
+)
+def test_url_join_ipv6_zone_id(url, relative, expected):
+    """
+    Joining a URL preserves the canonical RFC 6874 form of the host.
+    """
+    joined = httpcore.URL(url).join(relative)
+    assert bytes(joined) == expected
+
+
 # Request
 
 

@@ -16,6 +16,8 @@ from httpcore import (
     ProxyError,
 )
 
+from .recording import RecordingBackend
+
 
 
 def test_proxy_forwarding():
@@ -276,3 +278,91 @@ def test_proxy_headers():
     assert proxy.headers == [
         (b"Proxy-Authorization", b"Basic dXNlcm5hbWU6cGFzc3dvcmQ=")
     ]
+
+
+
+@pytest.mark.parametrize(
+    "url,request_line,host_header",
+    [
+        (
+            "http://[fe80::1%25eth0]/path?x=1",
+            b"GET http://[fe80::1%25eth0]/path?x=1 HTTP/1.1\r\n",
+            b"Host: [fe80::1%25eth0]\r\n",
+        ),
+        (
+            "http://[fe80::1%25eth0]:8080/",
+            b"GET http://[fe80::1%25eth0]:8080/ HTTP/1.1\r\n",
+            b"Host: [fe80::1%25eth0]:8080\r\n",
+        ),
+    ],
+)
+def test_proxy_forwarding_with_ipv6_zone_id(url, request_line, host_header):
+    """
+    Requests sent via a forwarding proxy use the absolute-form request
+    target, with the bracketed RFC 6874 wire form of the IPv6 address,
+    matching the `Host` header.
+    """
+    network_backend = RecordingBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with ConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        network_backend=network_backend,
+    ) as proxy:
+        with proxy.stream("GET", url) as response:
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+    # The connection is made to the proxy...
+    assert network_backend.connections == [("localhost", 8080)]
+    # ...using an absolute-form request target for the remote origin.
+    sent = network_backend.streams[0].written
+    assert sent.startswith(request_line)
+    assert host_header in sent
+
+
+
+def test_proxy_tunneling_with_ipv6_zone_id():
+    """
+    The CONNECT request sent when tunneling uses the authority-form,
+    with the bracketed RFC 6874 wire form of the IPv6 address.
+    """
+    network_backend = RecordingBackend(
+        [
+            # The initial response to the proxy CONNECT
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            # The actual response from the remote server
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with ConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        network_backend=network_backend,
+    ) as proxy:
+        with proxy.stream("GET", "https://[fe80::1%25eth0]/") as response:
+            response.read()
+
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+    assert network_backend.connections == [("localhost", 8080)]
+    sent = network_backend.streams[0].written
+    assert sent.startswith(b"CONNECT [fe80::1%25eth0]:443 HTTP/1.1\r\n")
+    assert b"Host: [fe80::1%25eth0]:443\r\n" in sent
+    # The tunneled request uses the origin-form target.
+    assert b"GET / HTTP/1.1\r\n" in sent
+    assert b"Host: [fe80::1%25eth0]\r\n" in sent

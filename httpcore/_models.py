@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import ssl
 import typing
 import urllib.parse
@@ -106,6 +107,73 @@ DEFAULT_PORTS = {
 }
 
 
+def normalize_host(host: bytes) -> bytes:
+    """
+    Normalize a URL host component into its canonical form.
+
+    IPv6 literals are returned in square brackets, including any RFC 6874
+    zone identifier, such as `[fe80::1%25eth0]`. This canonical form is used
+    for the `Host` header, the HTTP/2 `:authority` pseudo-header, absolute
+    request targets, and the connection-reuse key, so that the display form,
+    the wire form, and the pooling behaviour of any given URL are always
+    consistent with each other.
+
+    Invalid IPv6 authorities raise a `ValueError` here, at the point the
+    URL or origin is constructed, rather than surfacing as a connection
+    failure once a request is sent.
+    """
+    if host.startswith(b"["):
+        if not host.endswith(b"]"):
+            raise ValueError(f"Invalid host {host!r}: mismatched brackets.")
+        inner = host[1:-1]
+    elif b":" in host:
+        inner = host
+    else:
+        return host
+
+    address, separator, zone = inner.partition(b"%")
+    if separator and (not zone.startswith(b"25") or zone == b"25"):
+        # RFC 6874 requires a percent-encoded '%25' delimiter,
+        # followed by a non-empty zone identifier.
+        raise ValueError(
+            f"Invalid host {host!r}: IPv6 zone identifiers must use "
+            "a '%25' delimiter followed by a non-empty zone identifier."
+        )
+    try:
+        ipaddress.IPv6Address(address.decode("ascii"))
+    except ValueError:
+        raise ValueError(f"Invalid host {host!r}: not a valid IPv6 address.") from None
+    return b"[" + inner + b"]"
+
+
+def connect_host(host: bytes) -> str:
+    """
+    Return the hostname to use when opening a network connection to
+    the given canonical URL host.
+
+    IPv6 literals have their brackets removed, and any RFC 6874 zone
+    identifier is percent-decoded, so that `[fe80::1%25eth0]` maps to
+    `fe80::1%eth0`, which is the form required by `getaddrinfo()`.
+    """
+    if host.startswith(b"["):
+        host = host[1:-1]
+    return urllib.parse.unquote(host.decode("ascii"))
+
+
+def sni_host(host: bytes) -> str:
+    """
+    Return the hostname to use as the TLS server name indication for
+    the given canonical URL host.
+
+    IPv6 literals have their brackets removed, and any RFC 6874 zone
+    identifier is dropped, since zone identifiers are local to the client
+    and are not meaningful to the remote server.
+    """
+    if host.startswith(b"["):
+        host = host[1:-1].partition(b"%")[0]
+    return host.decode("ascii")
+
+
 def include_request_headers(
     headers: list[tuple[bytes, bytes]],
     *,
@@ -161,7 +229,7 @@ class ByteStream:
 class Origin:
     def __init__(self, scheme: bytes, host: bytes, port: int) -> None:
         self.scheme = scheme
-        self.host = host
+        self.host = normalize_host(host)
         self.port = port
 
     def __eq__(self, other: typing.Any) -> bool:
@@ -265,16 +333,24 @@ class URL:
             target: The target of the HTTP request. Such as `"/items?search=red"`.
         """
         if url:
-            parsed = urllib.parse.urlparse(enforce_bytes(url, name="url"))
+            url_bytes = enforce_bytes(url, name="url")
+            try:
+                parsed = urllib.parse.urlparse(url_bytes)
+                port = parsed.port
+            except ValueError as exc:
+                # Ensure that invalid authorities, such as mismatched brackets
+                # or an invalid port, raise a clear error at the point the URL
+                # is constructed, rather than failing once a request is sent.
+                raise ValueError(f"Invalid URL {url_bytes!r}: {exc}") from None
             self.scheme = parsed.scheme
-            self.host = parsed.hostname or b""
-            self.port = parsed.port
+            self.host = normalize_host(parsed.hostname or b"")
+            self.port = port
             self.target = (parsed.path or b"/") + (
                 b"?" + parsed.query if parsed.query else b""
             )
         else:
             self.scheme = enforce_bytes(scheme, name="scheme")
-            self.host = enforce_bytes(host, name="host")
+            self.host = normalize_host(enforce_bytes(host, name="host"))
             self.port = port
             self.target = enforce_bytes(target, name="target")
 
@@ -291,6 +367,46 @@ class URL:
         return Origin(
             scheme=self.scheme, host=self.host, port=self.port or default_port
         )
+
+    def copy_with(
+        self,
+        *,
+        scheme: bytes | str | None = None,
+        host: bytes | str | None = None,
+        port: int | None = None,
+        target: bytes | str | None = None,
+    ) -> "URL":
+        """
+        Return a copy of the URL, with any keyword arguments overriding
+        the corresponding components of the existing URL.
+
+        For example:
+
+        ```python
+        url = httpcore.URL("http://[fe80::1%25eth0]/")
+        url.copy_with(port=8080)  # URL for 'http://[fe80::1%25eth0]:8080/'
+        ```
+        """
+        return URL(
+            scheme=self.scheme if scheme is None else scheme,
+            host=self.host if host is None else host,
+            port=self.port if port is None else port,
+            target=self.target if target is None else target,
+        )
+
+    def join(self, url: bytes | str) -> "URL":
+        """
+        Resolve a possibly-relative URL against this URL, returning a new URL.
+
+        For example:
+
+        ```python
+        url = httpcore.URL("http://[fe80::1%25eth0]/some/path")
+        url.join("../other")  # URL for 'http://[fe80::1%25eth0]/other'
+        ```
+        """
+        relative = enforce_bytes(url, name="url")
+        return URL(urllib.parse.urljoin(bytes(self), relative))
 
     def __eq__(self, other: typing.Any) -> bool:
         return (
