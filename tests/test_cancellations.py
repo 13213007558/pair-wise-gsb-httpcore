@@ -171,6 +171,27 @@ async def test_h11_timeout_during_response():
         assert conn.is_closed()
 
 
+@pytest.mark.anyio
+async def test_h11_timeout_during_expect_100_continue_wait():
+    """
+    An async timeout on an HTTP/1.1 connection while waiting for a
+    "100 Continue" response should leave the connection in a neatly
+    closed state.
+    """
+    origin = httpcore.Origin(b"http", b"example.com", 80)
+    stream = SlowReadStream([])
+    async with httpcore.AsyncHTTP11Connection(origin, stream) as conn:
+        with anyio.move_on_after(0.01):
+            await conn.request(
+                "POST",
+                "http://example.com",
+                headers={"Expect": "100-continue"},
+                content=b"Hello, world!",
+                extensions={"timeout": {"continue": None}},
+            )
+        assert conn.is_closed()
+
+
 @pytest.mark.xfail
 @pytest.mark.anyio
 async def test_h2_timeout_during_handshake():

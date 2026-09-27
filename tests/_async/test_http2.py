@@ -47,6 +47,49 @@ async def test_http2_connection():
 
 
 @pytest.mark.anyio
+async def test_http2_connection_with_expect_100_continue():
+    """
+    HTTP/2 does not support "100 Continue". An "Expect: 100-continue"
+    header is sent as-is, and the request body is sent immediately,
+    without waiting for any informational response.
+    """
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    async with httpcore.AsyncHTTP2Connection(
+        origin=origin, stream=stream, keepalive_expiry=5.0
+    ) as conn:
+        response = await conn.request(
+            "POST",
+            "https://example.com/",
+            headers={"Expect": "100-continue"},
+            content=b"Hello, world!",
+        )
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        assert conn.is_idle()
+        assert conn.is_available()
+        assert not conn.is_closed()
+
+
+@pytest.mark.anyio
 async def test_http2_connection_closed():
     origin = httpcore.Origin(b"https", b"example.com", 443)
     stream = httpcore.AsyncMockStream(

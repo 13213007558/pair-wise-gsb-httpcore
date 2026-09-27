@@ -13,6 +13,7 @@ from .._backends.base import AsyncNetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadTimeout,
     RemoteProtocolError,
     WriteError,
     map_exceptions,
@@ -24,6 +25,11 @@ from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
 
+
+# The default timeout, in seconds, that the client will wait for a
+# "100 Continue" response before sending the request body anyways,
+# when sending a request that includes "Expect: 100-continue".
+DEFAULT_CONTINUE_TIMEOUT = 1.0
 
 # A subset of `h11.Event` types supported by `_send_event`
 H11SendEvent = typing.Union[
@@ -79,13 +85,14 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
 
         try:
             kwargs = {"request": request}
+            response_event: h11.Response | h11.InformationalResponse | None = None
             try:
                 async with Trace(
                     "send_request_headers", logger, request, kwargs
                 ) as trace:
                     await self._send_request_headers(**kwargs)
                 async with Trace("send_request_body", logger, request, kwargs) as trace:
-                    await self._send_request_body(**kwargs)
+                    response_event = await self._send_request_body(**kwargs)
             except WriteError:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
@@ -103,7 +110,9 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                     reason_phrase,
                     headers,
                     trailing_data,
-                ) = await self._receive_response_headers(**kwargs)
+                ) = await self._receive_response_headers(
+                    response_event=response_event, **kwargs
+                )
                 trace.return_value = (
                     http_version,
                     status,
@@ -149,9 +158,29 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             )
         await self._send_event(event, timeout=timeout)
 
-    async def _send_request_body(self, request: Request) -> None:
+    async def _send_request_body(
+        self, request: Request
+    ) -> h11.Response | h11.InformationalResponse | None:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("write", None)
+
+        if self._expect_100_continue(request):
+            # The request included "Expect: 100-continue", so we wait for
+            # the server to indicate that we should send the request body.
+            response_event = await self._wait_for_100_continue(request)
+            if response_event is not None:
+                # The server sent a final response, such as
+                # "417 Expectation Failed", without first sending a
+                # "100 Continue" response. The request body must not be
+                # sent. If the request had no body, then we can still
+                # complete our side of the message exchange, allowing
+                # the connection to be reused. Otherwise the connection
+                # will be closed once the response has been read.
+                try:
+                    await self._send_event(h11.EndOfMessage(), timeout=timeout)
+                except h11.LocalProtocolError:
+                    pass
+                return response_event
 
         assert isinstance(request.stream, typing.AsyncIterable)
         async for chunk in request.stream:
@@ -159,6 +188,60 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             await self._send_event(event, timeout=timeout)
 
         await self._send_event(h11.EndOfMessage(), timeout=timeout)
+        return None
+
+    def _expect_100_continue(self, request: Request) -> bool:
+        return any(
+            name.lower() == b"expect" and value.lower() == b"100-continue"
+            for name, value in request.headers
+        )
+
+    async def _wait_for_100_continue(
+        self, request: Request
+    ) -> h11.Response | h11.InformationalResponse | None:
+        """
+        Wait for a "100 Continue" informational response from the server.
+
+        Returns `None` if the request body should be sent, either because a
+        "100 Continue" response was received, or because the continue timeout
+        expired without any response from the server. Returns the response
+        event if the server sent a final response, in which case the request
+        body must not be sent.
+        """
+        timeouts = request.extensions.get("timeout", {})
+        continue_timeout = timeouts.get("continue", DEFAULT_CONTINUE_TIMEOUT)
+        deadline = (
+            None if continue_timeout is None else time.monotonic() + continue_timeout
+        )
+
+        while True:
+            timeout = (
+                None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            )
+            try:
+                event = await self._receive_event(timeout=timeout)
+            except ReadTimeout:
+                # The continue timeout expired without any response from
+                # the server. This is not an error. The request body
+                # should be sent anyways.
+                return None
+
+            if isinstance(event, h11.InformationalResponse):
+                if event.status_code == 100:
+                    # The server has indicated that we should send the
+                    # request body.
+                    return None
+                if event.status_code == 101:
+                    # A "101 Switching Protocols" response is a final
+                    # response, not an informational one.
+                    return event
+                # Other informational responses, such as "103 Early Hints",
+                # neither indicate that the request body should be sent,
+                # nor are a final response. Keep waiting.
+            elif isinstance(event, h11.Response):
+                # A final response, such as "417 Expectation Failed".
+                # The request body must not be sent.
+                return event
 
     async def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
@@ -168,13 +251,17 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
     # Receiving the response...
 
     async def _receive_response_headers(
-        self, request: Request
+        self,
+        request: Request,
+        response_event: h11.Response | h11.InformationalResponse | None = None,
     ) -> tuple[bytes, int, bytes, list[tuple[bytes, bytes]], bytes]:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("read", None)
 
+        event: h11.Event | type[h11.PAUSED] | None = response_event
         while True:
-            event = await self._receive_event(timeout=timeout)
+            if event is None:
+                event = await self._receive_event(timeout=timeout)
             if isinstance(event, h11.Response):
                 break
             if (
@@ -182,6 +269,7 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                 and event.status_code == 101
             ):
                 break
+            event = None
 
         http_version = b"HTTP/" + event.http_version
 
