@@ -8,6 +8,8 @@ import trio as concurrency
 
 import httpcore
 
+from .recording import RecordingBackend
+
 
 @pytest.mark.anyio
 async def test_connection_pool_with_keepalive():
@@ -834,4 +836,63 @@ async def test_http11_upgrade_connection():
         "http11.receive_response_headers.complete",
         "http11.response_closed.started",
         "http11.response_closed.complete",
+    ]
+
+
+@pytest.mark.anyio
+async def test_connection_pool_with_ipv6_zone_id():
+    """
+    The connection-reuse key is stable for semantically equivalent URLs,
+    while differing zone identifiers or ports require their own connections.
+    """
+    network_backend = RecordingBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        # Requests to the same origin, with an implicit or explicit default
+        # port, share a single connection.
+        async with pool.stream("GET", "http://[fe80::1%25eth0]/") as response:
+            await response.aread()
+        async with pool.stream("GET", "http://[fe80::1%25eth0]:80/") as response:
+            await response.aread()
+
+        assert response.status == 200
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<AsyncHTTPConnection ['http://[fe80::1%25eth0]:80', HTTP/1.1, IDLE, Request Count: 2]>"
+        ]
+
+        # A different zone identifier requires a new connection.
+        async with pool.stream("GET", "http://[fe80::1%25eth1]/") as response:
+            await response.aread()
+
+        # A different port requires a new connection.
+        async with pool.stream("GET", "http://[fe80::1%25eth0]:8080/") as response:
+            await response.aread()
+
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<AsyncHTTPConnection ['http://[fe80::1%25eth0]:80', HTTP/1.1, IDLE, Request Count: 2]>",
+            "<AsyncHTTPConnection ['http://[fe80::1%25eth1]:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            "<AsyncHTTPConnection ['http://[fe80::1%25eth0]:8080', HTTP/1.1, IDLE, Request Count: 1]>",
+        ]
+
+    # IPv6 connections are opened without brackets, and with the zone
+    # identifier percent-decoded, as required by `getaddrinfo()`.
+    assert network_backend.connections == [
+        ("fe80::1%eth0", 80),
+        ("fe80::1%eth1", 80),
+        ("fe80::1%eth0", 8080),
     ]

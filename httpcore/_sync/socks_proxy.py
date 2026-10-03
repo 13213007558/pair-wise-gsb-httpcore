@@ -8,7 +8,16 @@ import socksio
 from .._backends.sync import SyncBackend
 from .._backends.base import NetworkBackend, NetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
-from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
+from .._models import (
+    URL,
+    Origin,
+    Request,
+    Response,
+    connect_host,
+    enforce_bytes,
+    enforce_url,
+    sni_host,
+)
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
@@ -223,7 +232,7 @@ class Socks5Connection(ConnectionInterface):
                 try:
                     # Connect to the proxy
                     kwargs = {
-                        "host": self._proxy_origin.host.decode("ascii"),
+                        "host": connect_host(self._proxy_origin.host),
                         "port": self._proxy_origin.port,
                         "timeout": timeout,
                     }
@@ -234,7 +243,7 @@ class Socks5Connection(ConnectionInterface):
                     # Connect to the remote host using socks5
                     kwargs = {
                         "stream": stream,
-                        "host": self._remote_origin.host.decode("ascii"),
+                        "host": connect_host(self._remote_origin.host),
                         "port": self._remote_origin.port,
                         "auth": self._proxy_auth,
                     }
@@ -259,7 +268,7 @@ class Socks5Connection(ConnectionInterface):
                         kwargs = {
                             "ssl_context": ssl_context,
                             "server_hostname": sni_hostname
-                            or self._remote_origin.host.decode("ascii"),
+                            or sni_host(self._remote_origin.host),
                             "timeout": timeout,
                         }
                         with Trace("start_tls", logger, request, kwargs) as trace:

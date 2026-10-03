@@ -9,7 +9,7 @@ import typing
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectError, ConnectTimeout
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, connect_host, sni_host
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -114,7 +114,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             try:
                 if self._uds is None:
                     kwargs = {
-                        "host": self._origin.host.decode("ascii"),
+                        "host": connect_host(self._origin.host),
                         "port": self._origin.port,
                         "local_address": self._local_address,
                         "timeout": timeout,
@@ -148,8 +148,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
 
                     kwargs = {
                         "ssl_context": ssl_context,
-                        "server_hostname": sni_hostname
-                        or self._origin.host.decode("ascii"),
+                        "server_hostname": sni_hostname or sni_host(self._origin.host),
                         "timeout": timeout,
                     }
                     async with Trace("start_tls", logger, request, kwargs) as trace:

@@ -2,6 +2,8 @@ import pytest
 
 import httpcore
 
+from .recording import RecordingStream
+
 
 @pytest.mark.anyio
 async def test_http11_connection():
@@ -378,3 +380,50 @@ async def test_http11_header_sub_100kb():
         response = await conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url,request_line,host_header",
+    [
+        (
+            "http://[fe80::1%25eth0]/path?x=1",
+            b"GET /path?x=1 HTTP/1.1\r\n",
+            b"Host: [fe80::1%25eth0]\r\n",
+        ),
+        (
+            "http://[fe80::1%25eth0]:8080/",
+            b"GET / HTTP/1.1\r\n",
+            b"Host: [fe80::1%25eth0]:8080\r\n",
+        ),
+        (
+            "http://[fe80::1]/",
+            b"GET / HTTP/1.1\r\n",
+            b"Host: [fe80::1]\r\n",
+        ),
+    ],
+)
+async def test_http11_request_with_ipv6_zone_id(url, request_line, host_header):
+    """
+    The request target uses the origin-form, and the `Host` header uses
+    the bracketed RFC 6874 wire form of the IPv6 address, including any
+    percent-encoded zone identifier.
+    """
+    origin = httpcore.URL(url).origin
+    stream = RecordingStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request("GET", url)
+        assert response.status == 200
+        await response.aread()
+
+    sent = stream.written
+    assert sent.startswith(request_line)
+    assert host_header in sent
