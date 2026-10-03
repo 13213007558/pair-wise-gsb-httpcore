@@ -1,3 +1,5 @@
+import typing
+
 import pytest
 
 import httpcore
@@ -378,3 +380,61 @@ async def test_http11_header_sub_100kb():
         response = await conn.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b""
+
+
+class RecordingStream(httpcore.AsyncMockStream):
+    """
+    A mock stream that records everything that is written to it.
+    """
+
+    def __init__(self, buffer: typing.List[bytes]) -> None:
+        super().__init__(buffer)
+        self.written = b""
+
+    async def write(
+        self, buffer: bytes, timeout: typing.Optional[float] = None
+    ) -> None:
+        self.written += buffer
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url,raw_path,host_header",
+    [
+        ("http://example.com/path?x=1", b"/path?x=1", b"example.com"),
+        ("http://example.com:8080/path", b"/path", b"example.com:8080"),
+        ("http://[::1]/path", b"/path", b"[::1]"),
+        ("http://[fe80::1%25eth0]/path", b"/path", b"[fe80::1%25eth0]"),
+        ("http://[fe80::1%eth0]/path", b"/path", b"[fe80::1%25eth0]"),
+        (
+            "http://[fe80::1%25eth0]:8080/path",
+            b"/path",
+            b"[fe80::1%25eth0]:8080",
+        ),
+    ],
+)
+async def test_http11_request_raw_path_and_host_header(url, raw_path, host_header):
+    """
+    The request target and 'Host' header should be consistent for a given
+    semantic URL, including IPv6 literals with RFC 6874 zone identifiers.
+    """
+    origin = httpcore.URL(url).origin
+    stream = RecordingStream(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+    async with httpcore.AsyncHTTP11Connection(origin=origin, stream=stream) as conn:
+        response = await conn.request("GET", url)
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+    head = stream.written.split(b"\r\n\r\n")[0]
+    request_line, _, header_lines = head.partition(b"\r\n")
+    headers = dict(line.split(b": ", 1) for line in header_lines.split(b"\r\n"))
+    assert request_line == b"GET " + raw_path + b" HTTP/1.1"
+    assert headers[b"Host"] == host_header

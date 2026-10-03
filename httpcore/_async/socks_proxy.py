@@ -8,7 +8,15 @@ import socksio
 from .._backends.auto import AutoBackend
 from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
-from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
+from .._models import (
+    URL,
+    Origin,
+    Request,
+    Response,
+    enforce_bytes,
+    enforce_url,
+    host_to_wire_form,
+)
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -223,7 +231,9 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                 try:
                     # Connect to the proxy
                     kwargs = {
-                        "host": self._proxy_origin.host.decode("ascii"),
+                        "host": host_to_wire_form(self._proxy_origin.host).decode(
+                            "ascii"
+                        ),
                         "port": self._proxy_origin.port,
                         "timeout": timeout,
                     }

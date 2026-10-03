@@ -1,3 +1,5 @@
+import typing
+
 import hpack
 import hyperframe.frame
 import pytest
@@ -380,3 +382,80 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+class RecordingStream(httpcore.MockStream):
+    """
+    A mock stream that records everything that is written to it.
+    """
+
+    def __init__(self, buffer: typing.List[bytes]) -> None:
+        super().__init__(buffer)
+        self.written = b""
+
+    def write(
+        self, buffer: bytes, timeout: typing.Optional[float] = None
+    ) -> None:
+        self.written += buffer
+
+
+
+@pytest.mark.parametrize(
+    "url,authority",
+    [
+        ("https://example.com/path", b"example.com"),
+        ("https://example.com:8443/path", b"example.com:8443"),
+        ("https://[fe80::1%25eth0]/path", b"[fe80::1%25eth0]"),
+        ("https://[fe80::1%eth0]/path", b"[fe80::1%25eth0]"),
+        ("https://[fe80::1%25eth0]:8443/path", b"[fe80::1%25eth0]:8443"),
+    ],
+)
+def test_http2_pseudo_headers_with_ipv6_zone_identifier(url, authority):
+    """
+    The ':authority' and ':path' pseudo-headers should be consistent for a
+    given semantic URL, including IPv6 literals with RFC 6874 zone identifiers.
+    """
+    origin = httpcore.URL(url).origin
+    stream = RecordingStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        response = conn.request("GET", url)
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+    # Split the sent bytes into frames, skipping the connection preface.
+    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    data = stream.written
+    assert data.startswith(preface)
+    headers_block = b""
+    pos = len(preface)
+    while pos < len(data):
+        frame, length = hyperframe.frame.Frame.parse_frame_header(
+            memoryview(data[pos : pos + 9])
+        )
+        frame.parse_body(memoryview(data[pos + 9 : pos + 9 + length]))
+        if isinstance(frame, hyperframe.frame.HeadersFrame):
+            headers_block += frame.data
+        pos += 9 + length
+
+    headers = dict(hpack.Decoder().decode(headers_block, raw=True))
+    assert headers[b":method"] == b"GET"
+    assert headers[b":scheme"] == b"https"
+    assert headers[b":authority"] == authority
+    assert headers[b":path"] == b"/path"

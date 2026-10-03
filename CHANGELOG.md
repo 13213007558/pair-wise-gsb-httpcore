@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Fix URL handling of IPv6 literals with RFC 6874 zone identifiers. Equivalent
+  addresses now normalize onto the same connection pool key, `Host` headers and
+  URL display forms enclose IPv6 literals in square brackets, connections use
+  the on-the-wire form of any zone identifier, and invalid authorities raise
+  `ValueError` at construction time.
 
 ## Version 1.0.9 (April 24th, 2025)
 

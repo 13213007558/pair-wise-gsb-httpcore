@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import ssl
 import typing
 import urllib.parse
@@ -106,6 +107,82 @@ DEFAULT_PORTS = {
 }
 
 
+# Characters that may not appear within the host portion of a URL authority.
+INVALID_HOST_CHARS = b" \t\r\n/?#@[]"
+
+
+def is_ipv6_address(host: bytes) -> bool:
+    """
+    Return `True` if the given host is an IPv6 literal, such as `b"::1"`.
+
+    IPv6 literals are the only valid hosts that may include ":" characters.
+    """
+    return b":" in host
+
+
+def normalize_host(host: bytes) -> bytes:
+    """
+    Normalize the host portion of a URL, so that semantically equivalent
+    addresses always compare equal, and map onto the same connection pool key.
+
+    * Square brackets around IPv6 literals are removed, so that
+      `b"[::1]"` and `b"::1"` are treated equivalently.
+    * IPv6 zone identifiers are normalized to the RFC 6874 percent-encoded
+      form, so that `b"fe80::1%eth0"` and `b"fe80::1%25eth0"` are treated
+      as the same address.
+    """
+    if host.startswith(b"[") and host.endswith(b"]") and len(host) > 2:
+        host = host[1:-1]
+    if is_ipv6_address(host) and b"%" in host:
+        address, _, zone_id = host.partition(b"%")
+        if not zone_id.startswith(b"25"):
+            # A plain "%" separator, as used on-the-wire, rather than
+            # the percent-encoded "%25" separator used within URLs.
+            host = address + b"%25" + zone_id
+    return host
+
+
+def validate_host(host: bytes) -> None:
+    """
+    Ensure that the host portion of a URL is valid, raising a clear error
+    at the point of construction, rather than failing later once a request
+    is sent.
+    """
+    if any(char in host for char in INVALID_HOST_CHARS):
+        raise ValueError(f"Invalid character in URL host: {host!r}")
+    if is_ipv6_address(host):
+        try:
+            ipaddress.IPv6Address(host_to_wire_form(host).decode("ascii"))
+        except ValueError:
+            raise ValueError(f"Invalid IPv6 address in URL host: {host!r}")
+
+
+def host_to_wire_form(host: bytes) -> bytes:
+    """
+    Convert the host portion of a URL into the form used when establishing
+    a network connection.
+
+    IPv6 zone identifiers use a percent-encoded "%25" separator within URLs,
+    but a plain "%" separator when connecting, such as `b"fe80::1%eth0"`.
+    """
+    if is_ipv6_address(host) and b"%25" in host:
+        address, _, zone_id = host.partition(b"%25")
+        return address + b"%" + urllib.parse.unquote_to_bytes(zone_id)
+    return host
+
+
+def host_to_display_form(host: bytes) -> bytes:
+    """
+    Convert the host portion of a URL into the form used within URLs,
+    `Host` headers, and other textual representations.
+
+    IPv6 literals are enclosed in square brackets, such as `b"[::1]"`.
+    """
+    if is_ipv6_address(host):
+        return b"[" + host + b"]"
+    return host
+
+
 def include_request_headers(
     headers: list[tuple[bytes, bytes]],
     *,
@@ -116,10 +193,11 @@ def include_request_headers(
 
     if b"host" not in headers_set:
         default_port = DEFAULT_PORTS.get(url.scheme)
+        host = host_to_display_form(url.host)
         if url.port is None or url.port == default_port:
-            header_value = url.host
+            header_value = host
         else:
-            header_value = b"%b:%d" % (url.host, url.port)
+            header_value = b"%b:%d" % (host, url.port)
         headers = [(b"Host", header_value)] + headers
 
     if (
@@ -174,7 +252,7 @@ class Origin:
 
     def __str__(self) -> str:
         scheme = self.scheme.decode("ascii")
-        host = self.host.decode("ascii")
+        host = host_to_display_form(self.host).decode("ascii")
         port = str(self.port)
         return f"{scheme}://{host}:{port}"
 
@@ -265,18 +343,26 @@ class URL:
             target: The target of the HTTP request. Such as `"/items?search=red"`.
         """
         if url:
-            parsed = urllib.parse.urlparse(enforce_bytes(url, name="url"))
+            url_bytes = enforce_bytes(url, name="url")
+            try:
+                parsed = urllib.parse.urlparse(url_bytes)
+                # Accessing '.port' validates any port that is included
+                # in the authority, raising 'ValueError' if it is invalid.
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError(f"Invalid URL {url_bytes!r}: {exc}") from exc
             self.scheme = parsed.scheme
-            self.host = parsed.hostname or b""
-            self.port = parsed.port
+            self.host = normalize_host(parsed.hostname or b"")
+            self.port = port
             self.target = (parsed.path or b"/") + (
                 b"?" + parsed.query if parsed.query else b""
             )
         else:
             self.scheme = enforce_bytes(scheme, name="scheme")
-            self.host = enforce_bytes(host, name="host")
+            self.host = normalize_host(enforce_bytes(host, name="host"))
             self.port = port
             self.target = enforce_bytes(target, name="target")
+        validate_host(self.host)
 
     @property
     def origin(self) -> Origin:
@@ -302,9 +388,10 @@ class URL:
         )
 
     def __bytes__(self) -> bytes:
+        host = host_to_display_form(self.host)
         if self.port is None:
-            return b"%b://%b%b" % (self.scheme, self.host, self.target)
-        return b"%b://%b:%d%b" % (self.scheme, self.host, self.port, self.target)
+            return b"%b://%b%b" % (self.scheme, host, self.target)
+        return b"%b://%b:%d%b" % (self.scheme, host, self.port, self.target)
 
     def __repr__(self) -> str:
         return (

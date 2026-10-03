@@ -9,7 +9,7 @@ import typing
 from .._backends.auto import AutoBackend
 from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectError, ConnectTimeout
-from .._models import Origin, Request, Response
+from .._models import Origin, Request, Response, host_to_wire_form
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
@@ -114,7 +114,7 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
             try:
                 if self._uds is None:
                     kwargs = {
-                        "host": self._origin.host.decode("ascii"),
+                        "host": host_to_wire_form(self._origin.host).decode("ascii"),
                         "port": self._origin.port,
                         "local_address": self._local_address,
                         "timeout": timeout,

@@ -835,3 +835,101 @@ async def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+class RecordingBackend(httpcore.AsyncMockBackend):
+    """
+    A mock backend that records the host and port of each connection.
+    """
+
+    def __init__(self, buffer: typing.List[bytes]) -> None:
+        super().__init__(buffer)
+        self.connections: typing.List[typing.Tuple[str, int]] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: typing.Optional[float] = None,
+        local_address: typing.Optional[str] = None,
+        socket_options: typing.Optional[typing.Iterable[httpcore.SOCKET_OPTION]] = None,
+    ) -> httpcore.AsyncNetworkStream:
+        self.connections.append((host, port))
+        return await super().connect_tcp(
+            host,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+
+HTTP11_RESPONSE = [
+    b"HTTP/1.1 200 OK\r\n",
+    b"Content-Type: plain/text\r\n",
+    b"Content-Length: 13\r\n",
+    b"\r\n",
+    b"Hello, world!",
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url",
+    [
+        # The percent-encoded and plain forms of the zone identifier.
+        "http://[fe80::1%25eth0]/",
+        "http://[fe80::1%eth0]/",
+        # An explicit port matching the scheme default.
+        "http://[fe80::1%25eth0]:80/",
+    ],
+)
+async def test_connection_pool_reuses_connections_for_equivalent_ipv6_urls(url):
+    """
+    Semantically equivalent URLs map onto the same connection pool key,
+    even if an IPv6 zone identifier is spelled differently.
+    """
+    network_backend = RecordingBackend(HTTP11_RESPONSE * 2)
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        response = await pool.request("GET", "http://[fe80::1%25eth0]/")
+        assert response.status == 200
+        response = await pool.request("GET", url)
+        assert response.status == 200
+
+        # Both requests reused a single connection.
+        assert len(pool.connections) == 1
+        assert repr(pool.connections[0]) == (
+            "<AsyncHTTPConnection ['http://[fe80::1%25eth0]:80', "
+            "HTTP/1.1, IDLE, Request Count: 2]>"
+        )
+
+    # The connection used the on-the-wire form of the zone identifier.
+    assert network_backend.connections == [("fe80::1%eth0", 80)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[fe80::1%25eth1]/",  # A differing zone identifier.
+        "http://[fe80::2%25eth0]/",  # A differing address.
+        "http://[fe80::1%25eth0]:8080/",  # A differing port.
+    ],
+)
+async def test_connection_pool_does_not_merge_differing_ipv6_zones(url):
+    """
+    URLs that differ by zone identifier, address, or port must not be
+    merged onto the same connection.
+    """
+    network_backend = RecordingBackend(HTTP11_RESPONSE * 2)
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        response = await pool.request("GET", "http://[fe80::1%25eth0]/")
+        assert response.status == 200
+        response = await pool.request("GET", url)
+        assert response.status == 200
+
+        # Each request required a separate connection.
+        assert len(pool.connections) == 2
+
+    # Both connections used the on-the-wire form of the zone identifier.
+    assert network_backend.connections[0] == ("fe80::1%eth0", 80)
