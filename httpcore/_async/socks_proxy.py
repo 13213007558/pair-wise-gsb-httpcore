@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import ssl
+import typing
 
 import socksio
 
@@ -39,16 +40,123 @@ REPLY_CODES = {
 }
 
 
+class AsyncSOCKS5Stream(AsyncNetworkStream):
+    """
+    A stream wrapper that buffers any bytes read beyond the current SOCKS5
+    negotiation message.
+
+    SOCKS5 replies may arrive split across several network reads, and a
+    single read may also contain bytes that belong to the tunneled target
+    connection. We frame each negotiation message explicitly so that target
+    data following a successful reply is preserved instead of being parsed
+    as another SOCKS5 message.
+    """
+
+    def __init__(self, stream: AsyncNetworkStream) -> None:
+        self._stream = stream
+        self._read_buffer = bytearray()
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if self._read_buffer:
+            data = bytes(self._read_buffer[:max_bytes])
+            del self._read_buffer[:max_bytes]
+            return data
+        return await self._stream.read(max_bytes, timeout)
+
+    async def read_exact(
+        self, num_bytes: int, timeout: float | None = None
+    ) -> bytes:
+        """
+        Read exactly `num_bytes`, accumulating across fragmented reads and
+        leaving any surplus bytes in the local buffer.
+        """
+        while len(self._read_buffer) < num_bytes:
+            incoming = await self._stream.read(4096, timeout)
+            if not incoming:
+                raise ProxyError("Proxy Server closed the connection unexpectedly.")
+            self._read_buffer.extend(incoming)
+        data = bytes(self._read_buffer[:num_bytes])
+        del self._read_buffer[:num_bytes]
+        return data
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        await self._stream.write(buffer, timeout)
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    async def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncNetworkStream:
+        # Keep wrapping the upgraded stream so any target data already
+        # buffered during the SOCKS5 negotiation remains readable.
+        self._stream = await self._stream.start_tls(
+            ssl_context, server_hostname=server_hostname, timeout=timeout
+        )
+        return self
+
+    def get_extra_info(self, info: str) -> typing.Any:
+        return self._stream.get_extra_info(info)
+
+
+async def _read_socks5_message(
+    stream: AsyncSOCKS5Stream,
+    conn: socksio.socks5.SOCKS5Connection,
+    timeout: float | None,
+) -> bytes:
+    """
+    Read a single complete SOCKS5 message, honoring the fixed-size header
+    and the length fields defined by RFC 1928 / RFC 1929.
+    """
+    version_and_method = await stream.read_exact(2, timeout)
+
+    if conn.state in (
+        socksio.socks5.SOCKS5State.SERVER_AUTH_REPLY,
+        socksio.socks5.SOCKS5State.SERVER_VERIFY_USERNAME_PASSWORD,
+    ):
+        # Method selection replies (RFC 1928) use VER=0x05 while
+        # username/password replies (RFC 1929) use the sub-negotiation
+        # version VER=0x01. Both messages are exactly two bytes, so the
+        # version byte is validated by the socksio state machine instead.
+        return version_and_method
+
+    version = version_and_method[0:1]
+    if version != b"\x05":
+        raise ProxyError("Malformed SOCKS5 reply received from proxy server.")
+
+    # SOCKS5 command reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+    address_type_byte = (await stream.read_exact(2, timeout))[1:2]
+    if address_type_byte == b"\x01":
+        address = await stream.read_exact(4, timeout)
+    elif address_type_byte == b"\x04":
+        address = await stream.read_exact(16, timeout)
+    elif address_type_byte == b"\x03":
+        length_byte = await stream.read_exact(1, timeout)
+        address = length_byte + await stream.read_exact(length_byte[0], timeout)
+    else:
+        raise ProxyError("Malformed SOCKS5 reply received from proxy server.")
+    port = await stream.read_exact(2, timeout)
+    return version_and_method + b"\x00" + address_type_byte + address + port
+
+
 async def _init_socks5_connection(
     stream: AsyncNetworkStream,
     *,
     host: bytes,
     port: int,
     auth: tuple[bytes, bytes] | None = None,
-) -> None:
+) -> AsyncSOCKS5Stream:
     conn = socksio.socks5.SOCKS5Connection()
+    socks_stream = AsyncSOCKS5Stream(stream)
 
-    # Auth method request
+    # Auth method request. When credentials are configured the client only
+    # advertises USERNAME/PASSWORD: a proxy that answers NO AUTHENTICATION
+    # REQUIRED would otherwise let the configured credentials be silently
+    # skipped, so that answer is treated as a negotiation failure rather
+    # than as a successful unauthenticated tunnel.
     auth_method = (
         socksio.socks5.SOCKS5AuthMethod.NO_AUTH_REQUIRED
         if auth is None
@@ -56,11 +164,14 @@ async def _init_socks5_connection(
     )
     conn.send(socksio.socks5.SOCKS5AuthMethodsRequest([auth_method]))
     outgoing_bytes = conn.data_to_send()
-    await stream.write(outgoing_bytes)
+    await socks_stream.write(outgoing_bytes)
 
     # Auth method response
-    incoming_bytes = await stream.read(max_bytes=4096)
-    response = conn.receive_data(incoming_bytes)
+    incoming_bytes = await _read_socks5_message(socks_stream, conn, timeout=None)
+    try:
+        response = conn.receive_data(incoming_bytes)
+    except socksio.exceptions.ProtocolError as exc:
+        raise ProxyError("Malformed SOCKS5 reply received from proxy server.") from exc
     assert isinstance(response, socksio.socks5.SOCKS5AuthReply)
     if response.method != auth_method:
         requested = AUTH_METHODS.get(auth_method, "UNKNOWN")
@@ -75,11 +186,16 @@ async def _init_socks5_connection(
         username, password = auth
         conn.send(socksio.socks5.SOCKS5UsernamePasswordRequest(username, password))
         outgoing_bytes = conn.data_to_send()
-        await stream.write(outgoing_bytes)
+        await socks_stream.write(outgoing_bytes)
 
         # Username/password response
-        incoming_bytes = await stream.read(max_bytes=4096)
-        response = conn.receive_data(incoming_bytes)
+        incoming_bytes = await _read_socks5_message(socks_stream, conn, timeout=None)
+        try:
+            response = conn.receive_data(incoming_bytes)
+        except socksio.exceptions.ProtocolError as exc:
+            raise ProxyError(
+                "Malformed username/password reply received from proxy server."
+            ) from exc
         assert isinstance(response, socksio.socks5.SOCKS5UsernamePasswordReply)
         if not response.success:
             raise ProxyError("Invalid username/password")
@@ -91,15 +207,20 @@ async def _init_socks5_connection(
         )
     )
     outgoing_bytes = conn.data_to_send()
-    await stream.write(outgoing_bytes)
+    await socks_stream.write(outgoing_bytes)
 
     # Connect response
-    incoming_bytes = await stream.read(max_bytes=4096)
-    response = conn.receive_data(incoming_bytes)
+    incoming_bytes = await _read_socks5_message(socks_stream, conn, timeout=None)
+    try:
+        response = conn.receive_data(incoming_bytes)
+    except socksio.exceptions.ProtocolError as exc:
+        raise ProxyError("Malformed SOCKS5 reply received from proxy server.") from exc
     assert isinstance(response, socksio.socks5.SOCKS5Reply)
     if response.reply_code != socksio.socks5.SOCKS5ReplyCode.SUCCEEDED:
         reply_code = REPLY_CODES.get(response.reply_code, "UNKOWN")
         raise ProxyError(f"Proxy Server could not connect: {reply_code}.")
+
+    return socks_stream
 
 
 class AsyncSOCKSProxy(AsyncConnectionPool):  # pragma: nocover
@@ -220,6 +341,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if self._connection is None:
+                stream: AsyncNetworkStream | None = None
                 try:
                     # Connect to the proxy
                     kwargs = {
@@ -241,7 +363,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                     async with Trace(
                         "setup_socks5_connection", logger, request, kwargs
                     ) as trace:
-                        await _init_socks5_connection(**kwargs)
+                        stream = await _init_socks5_connection(**kwargs)
                         trace.return_value = stream
 
                     # Upgrade the stream to SSL
@@ -292,6 +414,11 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                         )
                 except Exception as exc:
                     self._connect_failed = True
+                    # A failed negotiation leaves no usable tunnel. Close the
+                    # proxy connection so that neither TLS nor HTTP traffic is
+                    # ever attempted over it.
+                    if stream is not None:
+                        await stream.aclose()
                     raise exc
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()

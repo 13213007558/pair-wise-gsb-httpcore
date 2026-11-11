@@ -114,6 +114,16 @@ pool = httpcore.ConnectionPool(proxy=proxy)
 r = pool.request("GET", "https://www.example.com/")
 ```
 
+When `auth` is provided, the client advertises only the username/password
+authentication method (RFC 1929). A proxy that answers "no authentication
+required" is treated as a negotiation failure and raises a `ProxyError`: the
+configured credentials must never be silently skipped in favor of an
+unauthenticated tunnel. Any negotiation failure (an unsupported method, a
+failed or missing username/password sub-negotiation, or a failed `CONNECT`)
+closes the proxy connection before TLS or HTTP traffic is attempted. Domain
+name targets are sent to the proxy for remote resolution rather than being
+resolved locally.
+
 ---
 
 # Reference
