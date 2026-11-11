@@ -7,6 +7,10 @@ from pprint import pprint
 SUBS = [
     ('from .._backends.auto import AutoBackend', 'from .._backends.sync import SyncBackend'),
     ('import trio as concurrency', 'from tests import concurrency'),
+    ('_ASYNC_ONLY = True', '_ASYNC_ONLY = False'),
+    ('anyio.create_task_group', 'concurrency.open_nursery'),
+    ('get_async_cancelled_exc_class', 'get_sync_cancelled_exc_class'),
+    ('import anyio\n', ''),
     ('AsyncIterator', 'Iterator'),
     ('Async([A-Z][A-Za-z0-9_]*)', r'\2'),
     ('async def', 'def'),

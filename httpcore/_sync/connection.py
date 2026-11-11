@@ -11,7 +11,7 @@ from .._backends.base import SOCKET_OPTION, NetworkBackend, NetworkStream
 from .._exceptions import ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
-from .._synchronization import Lock
+from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
 from .http11 import HTTP11Connection
 from .interfaces import ConnectionInterface
@@ -72,35 +72,49 @@ class HTTPConnection(ConnectionInterface):
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
 
+        stream: NetworkStream | None = None
         try:
-            with self._request_lock:
-                if self._connection is None:
-                    stream = self._connect(request)
+            try:
+                with self._request_lock:
+                    if self._connection is None:
+                        stream = self._connect(request)
 
-                    ssl_object = stream.get_extra_info("ssl_object")
-                    http2_negotiated = (
-                        ssl_object is not None
-                        and ssl_object.selected_alpn_protocol() == "h2"
-                    )
-                    if http2_negotiated or (self._http2 and not self._http1):
-                        from .http2 import HTTP2Connection
-
-                        self._connection = HTTP2Connection(
-                            origin=self._origin,
-                            stream=stream,
-                            keepalive_expiry=self._keepalive_expiry,
+                        ssl_object = stream.get_extra_info("ssl_object")
+                        http2_negotiated = (
+                            ssl_object is not None
+                            and ssl_object.selected_alpn_protocol() == "h2"
                         )
-                    else:
-                        self._connection = HTTP11Connection(
-                            origin=self._origin,
-                            stream=stream,
-                            keepalive_expiry=self._keepalive_expiry,
-                        )
-        except BaseException as exc:
-            self._connect_failed = True
-            raise exc
+                        if http2_negotiated or (self._http2 and not self._http1):
+                            from .http2 import HTTP2Connection
 
-        return self._connection.handle_request(request)
+                            self._connection = HTTP2Connection(
+                                origin=self._origin,
+                                stream=stream,
+                                keepalive_expiry=self._keepalive_expiry,
+                            )
+                        else:
+                            self._connection = HTTP11Connection(
+                                origin=self._origin,
+                                stream=stream,
+                                keepalive_expiry=self._keepalive_expiry,
+                            )
+            except BaseException as exc:
+                self._connect_failed = True
+                raise exc
+
+            return self._connection.handle_request(request)
+        except BaseException:
+            # Safety net for the window in which a stream has been opened but
+            # has not yet been wrapped into (or has been wrapped and the very
+            # first request fails at an awaited checkpoint, e.g. a cancellation
+            # delivered by a `trace` callback). If no connection owns the
+            # stream, close it so its socket cannot leak. Once a connection
+            # exists it is responsible for its own cleanup.
+            with ShieldCancellation():
+                if self._connection is None and stream is not None:
+                    self._connect_failed = True
+                    stream.close()
+            raise
 
     def _connect(self, request: Request) -> NetworkStream:
         timeouts = request.extensions.get("timeout", {})
@@ -111,6 +125,14 @@ class HTTPConnection(ConnectionInterface):
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 
         while True:
+            # `stream` holds the most recently established network stream.
+            # If anything raises before the stream is handed off to a
+            # connection (a network failure, a timeout, a cancelled task, or
+            # an exception raised by a `trace` callback) then we must close
+            # the stream ourselves, otherwise its socket would leak and the
+            # connection pool would have no reference through which to close
+            # it later.
+            stream: NetworkStream | None = None
             try:
                 if self._uds is None:
                     kwargs = {
@@ -157,12 +179,24 @@ class HTTPConnection(ConnectionInterface):
                         trace.return_value = stream
                 return stream
             except (ConnectError, ConnectTimeout):
+                with ShieldCancellation():
+                    if stream is not None:
+                        stream.close()
+                        stream = None
                 if retries_left <= 0:
                     raise
                 retries_left -= 1
                 delay = next(delays)
                 with Trace("retry", logger, request, kwargs) as trace:
                     self._network_backend.sleep(delay)
+            except BaseException:
+                # Any other failure (including a `trace` callback exception or
+                # task cancellation) happens after a stream may already have
+                # been opened. Close it so the underlying socket cannot leak.
+                with ShieldCancellation():
+                    if stream is not None:
+                        stream.close()
+                raise
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin

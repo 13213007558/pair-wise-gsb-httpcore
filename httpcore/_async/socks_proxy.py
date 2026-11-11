@@ -10,7 +10,7 @@ from .._backends.base import AsyncNetworkBackend, AsyncNetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .connection_pool import AsyncConnectionPool
 from .http11 import AsyncHTTP11Connection
@@ -220,6 +220,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
 
         async with self._connect_lock:
             if self._connection is None:
+                stream: AsyncNetworkStream | None = None
                 try:
                     # Connect to the proxy
                     kwargs = {
@@ -290,8 +291,15 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
                         )
-                except Exception as exc:
+                except BaseException as exc:
                     self._connect_failed = True
+                    # A failure (network error, timeout, cancellation, or a
+                    # `trace` callback exception) may occur after the proxy
+                    # stream has been opened but before it is handed off to a
+                    # connection. Close it so its socket cannot leak.
+                    with AsyncShieldCancellation():
+                        if stream is not None:
+                            await stream.aclose()
                     raise exc
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()

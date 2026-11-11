@@ -10,7 +10,7 @@ from .._backends.base import NetworkBackend, NetworkStream
 from .._exceptions import ConnectionNotAvailable, ProxyError
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
-from .._synchronization import Lock
+from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
 from .connection_pool import ConnectionPool
 from .http11 import HTTP11Connection
@@ -220,6 +220,7 @@ class Socks5Connection(ConnectionInterface):
 
         with self._connect_lock:
             if self._connection is None:
+                stream: NetworkStream | None = None
                 try:
                     # Connect to the proxy
                     kwargs = {
@@ -290,8 +291,15 @@ class Socks5Connection(ConnectionInterface):
                             stream=stream,
                             keepalive_expiry=self._keepalive_expiry,
                         )
-                except Exception as exc:
+                except BaseException as exc:
                     self._connect_failed = True
+                    # A failure (network error, timeout, cancellation, or a
+                    # `trace` callback exception) may occur after the proxy
+                    # stream has been opened but before it is handed off to a
+                    # connection. Close it so its socket cannot leak.
+                    with ShieldCancellation():
+                        if stream is not None:
+                            stream.close()
                     raise exc
             elif not self._connection.is_available():  # pragma: nocover
                 raise ConnectionNotAvailable()

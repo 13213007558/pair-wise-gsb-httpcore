@@ -187,6 +187,14 @@ class AsyncSemaphore:
             self._anyio_semaphore.release()
 
 
+def get_async_cancelled_exc_class() -> type[BaseException]:
+    """
+    Return the cancellation exception class for the running async library
+    (asyncio's `CancelledError` or trio's `Cancelled`).
+    """
+    return anyio.get_cancelled_exc_class()
+
+
 class AsyncShieldCancellation:
     # For certain portions of our codebase where we're dealing with
     # closing connections during exception handling we want to shield
@@ -300,6 +308,18 @@ class Semaphore:
 
     def release(self) -> None:
         self._semaphore.release()
+
+
+class _NoCancellation(BaseException):
+    """Never raised: stand-in for a cancellation class in thread mode."""
+
+
+def get_sync_cancelled_exc_class() -> type[BaseException]:
+    # Thread-synchronous code has no cancellation semantics, so there is no
+    # exception class to match against. Returning a private, never-raised type
+    # keeps `except get_sync_cancelled_exc_class():` blocks inert without
+    # requiring an event loop (which anyio does not have in this context).
+    return _NoCancellation
 
 
 class ShieldCancellation:

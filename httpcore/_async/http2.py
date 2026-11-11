@@ -164,9 +164,22 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             )
         except BaseException as exc:  # noqa: PIE786
             with AsyncShieldCancellation():
-                kwargs = {"stream_id": stream_id}
-                async with Trace("response_closed", logger, request, kwargs):
-                    await self._response_closed(stream_id=stream_id)
+                try:
+                    kwargs = {"stream_id": stream_id}
+                    async with Trace("response_closed", logger, request, kwargs):
+                        await self._response_closed(stream_id=stream_id)
+                except BaseException as cleanup_exc:
+                    # The trace callback failed while closing this stream.
+                    # `_response_closed()` may not have run, which would leave
+                    # the H2 concurrency semaphore acquired and the stream id
+                    # booked in `_events`. Release just this stream's quota;
+                    # do not close the whole multiplexed connection, which may
+                    # still be servicing other streams.
+                    if exc is not cleanup_exc:
+                        await self._release_stream(stream_id)
+                    if exc is cleanup_exc:
+                        raise
+                    raise cleanup_exc from exc
 
             if isinstance(exc, h2.exceptions.ProtocolError):
                 # One case where h2 can raise a protocol error is when a
@@ -421,6 +434,34 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 if self._used_all_stream_ids:  # pragma: nocover
                     await self.aclose()
 
+    async def _release_stream(self, stream_id: int) -> None:
+        """
+        Release the per-stream resources (the concurrency quota and the
+        event bookkeeping) without closing the underlying connection.
+
+        Used as a safety net when a `response_closed` trace callback raises
+        before `_response_closed()` could run, so that a single failed stream
+        does not permanently consume an HTTP/2 concurrency slot. Other
+        streams multiplexed on the same connection are left untouched.
+
+        Idempotent: `_response_closed()` removes the stream id from `_events`
+        before releasing the semaphore, so an absent id means the quota was
+        already returned and must not be released a second time.
+        """
+        if self._events.pop(stream_id, None) is None:
+            return
+        await self._max_streams_semaphore.release()
+        async with self._state_lock:
+            if (
+                self._state == HTTPConnectionState.ACTIVE
+                and not self._events
+                and not self._connection_terminated
+            ):
+                self._state = HTTPConnectionState.IDLE
+                if self._keepalive_expiry is not None:
+                    now = time.monotonic()
+                    self._expire_at = now + self._keepalive_expiry
+
     async def aclose(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
@@ -588,5 +629,13 @@ class HTTP2ConnectionByteStream:
         if not self._closed:
             self._closed = True
             kwargs = {"stream_id": self._stream_id}
-            async with Trace("response_closed", logger, self._request, kwargs):
-                await self._connection._response_closed(stream_id=self._stream_id)
+            try:
+                async with Trace("response_closed", logger, self._request, kwargs):
+                    await self._connection._response_closed(stream_id=self._stream_id)
+            except BaseException:
+                # A failed trace callback must not strand this stream's
+                # concurrency quota. Release just this stream while keeping the
+                # shared connection open for any other in-flight streams.
+                with AsyncShieldCancellation():
+                    await self._connection._release_stream(self._stream_id)
+                raise

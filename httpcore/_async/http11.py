@@ -18,7 +18,11 @@ from .._exceptions import (
     map_exceptions,
 )
 from .._models import Origin, Request, Response
-from .._synchronization import AsyncLock, AsyncShieldCancellation
+from .._synchronization import (
+    AsyncLock,
+    AsyncShieldCancellation,
+    get_async_cancelled_exc_class,
+)
 from .._trace import Trace
 from .interfaces import AsyncConnectionInterface
 
@@ -69,13 +73,25 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
                 f"to {self._origin}"
             )
 
-        async with self._state_lock:
-            if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
-                self._request_count += 1
-                self._state = HTTPConnectionState.ACTIVE
-                self._expire_at = None
-            else:
-                raise ConnectionNotAvailable()
+        try:
+            async with self._state_lock:
+                if self._state in (HTTPConnectionState.NEW, HTTPConnectionState.IDLE):
+                    self._request_count += 1
+                    self._state = HTTPConnectionState.ACTIVE
+                    self._expire_at = None
+                else:
+                    raise ConnectionNotAvailable()
+        except get_async_cancelled_exc_class():
+            # Acquiring the lock is itself an awaitable checkpoint at which a
+            # pending cancellation (e.g. one requested by a `trace` callback
+            # during connection establishment) can be delivered before the
+            # request body of the handler runs. Close the connection so its
+            # socket is released rather than returned to the pool half-open.
+            # Ordinary control-flow signals such as `ConnectionNotAvailable`
+            # must not trigger this teardown.
+            with AsyncShieldCancellation():
+                await self.aclose()
+            raise
 
         try:
             kwargs = {"request": request}
@@ -131,8 +147,18 @@ class AsyncHTTP11Connection(AsyncConnectionInterface):
             )
         except BaseException as exc:
             with AsyncShieldCancellation():
-                async with Trace("response_closed", logger, request) as trace:
-                    await self._response_closed()
+                try:
+                    async with Trace("response_closed", logger, request) as trace:
+                        await self._response_closed()
+                except BaseException as cleanup_exc:
+                    # The trace callback (or the close itself) failed. Make
+                    # sure the connection is still torn down so the pool slot
+                    # and socket are released, while preserving the original
+                    # exception unless there was nothing to chain it from.
+                    if exc is cleanup_exc:
+                        raise
+                    await self.aclose()
+                    raise cleanup_exc from exc
             raise exc
 
     # Sending the request...
@@ -344,8 +370,18 @@ class HTTP11ConnectionByteStream:
     async def aclose(self) -> None:
         if not self._closed:
             self._closed = True
-            async with Trace("response_closed", logger, self._request):
-                await self._connection._response_closed()
+            try:
+                async with Trace("response_closed", logger, self._request):
+                    await self._connection._response_closed()
+            except BaseException:
+                # If the trace callback (or the close itself) raises then
+                # `_response_closed()` may not have run, leaving the connection
+                # stuck in the ACTIVE state and its pool slot permanently
+                # occupied. Unilaterally close the connection to release its
+                # socket, so the pool can detect and drop it.
+                with AsyncShieldCancellation():
+                    await self._connection.aclose()
+                raise
 
 
 class AsyncHTTP11UpgradeStream(AsyncNetworkStream):

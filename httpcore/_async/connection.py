@@ -11,7 +11,7 @@ from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend, AsyncNetworkStr
 from .._exceptions import ConnectError, ConnectTimeout
 from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
-from .._synchronization import AsyncLock
+from .._synchronization import AsyncLock, AsyncShieldCancellation
 from .._trace import Trace
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
@@ -72,35 +72,49 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                 f"Attempted to send request to {request.url.origin} on connection to {self._origin}"
             )
 
+        stream: AsyncNetworkStream | None = None
         try:
-            async with self._request_lock:
-                if self._connection is None:
-                    stream = await self._connect(request)
+            try:
+                async with self._request_lock:
+                    if self._connection is None:
+                        stream = await self._connect(request)
 
-                    ssl_object = stream.get_extra_info("ssl_object")
-                    http2_negotiated = (
-                        ssl_object is not None
-                        and ssl_object.selected_alpn_protocol() == "h2"
-                    )
-                    if http2_negotiated or (self._http2 and not self._http1):
-                        from .http2 import AsyncHTTP2Connection
-
-                        self._connection = AsyncHTTP2Connection(
-                            origin=self._origin,
-                            stream=stream,
-                            keepalive_expiry=self._keepalive_expiry,
+                        ssl_object = stream.get_extra_info("ssl_object")
+                        http2_negotiated = (
+                            ssl_object is not None
+                            and ssl_object.selected_alpn_protocol() == "h2"
                         )
-                    else:
-                        self._connection = AsyncHTTP11Connection(
-                            origin=self._origin,
-                            stream=stream,
-                            keepalive_expiry=self._keepalive_expiry,
-                        )
-        except BaseException as exc:
-            self._connect_failed = True
-            raise exc
+                        if http2_negotiated or (self._http2 and not self._http1):
+                            from .http2 import AsyncHTTP2Connection
 
-        return await self._connection.handle_async_request(request)
+                            self._connection = AsyncHTTP2Connection(
+                                origin=self._origin,
+                                stream=stream,
+                                keepalive_expiry=self._keepalive_expiry,
+                            )
+                        else:
+                            self._connection = AsyncHTTP11Connection(
+                                origin=self._origin,
+                                stream=stream,
+                                keepalive_expiry=self._keepalive_expiry,
+                            )
+            except BaseException as exc:
+                self._connect_failed = True
+                raise exc
+
+            return await self._connection.handle_async_request(request)
+        except BaseException:
+            # Safety net for the window in which a stream has been opened but
+            # has not yet been wrapped into (or has been wrapped and the very
+            # first request fails at an awaited checkpoint, e.g. a cancellation
+            # delivered by a `trace` callback). If no connection owns the
+            # stream, close it so its socket cannot leak. Once a connection
+            # exists it is responsible for its own cleanup.
+            with AsyncShieldCancellation():
+                if self._connection is None and stream is not None:
+                    self._connect_failed = True
+                    await stream.aclose()
+            raise
 
     async def _connect(self, request: Request) -> AsyncNetworkStream:
         timeouts = request.extensions.get("timeout", {})
@@ -111,6 +125,14 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 
         while True:
+            # `stream` holds the most recently established network stream.
+            # If anything raises before the stream is handed off to a
+            # connection (a network failure, a timeout, a cancelled task, or
+            # an exception raised by a `trace` callback) then we must close
+            # the stream ourselves, otherwise its socket would leak and the
+            # connection pool would have no reference through which to close
+            # it later.
+            stream: AsyncNetworkStream | None = None
             try:
                 if self._uds is None:
                     kwargs = {
@@ -157,12 +179,24 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                         trace.return_value = stream
                 return stream
             except (ConnectError, ConnectTimeout):
+                with AsyncShieldCancellation():
+                    if stream is not None:
+                        await stream.aclose()
+                        stream = None
                 if retries_left <= 0:
                     raise
                 retries_left -= 1
                 delay = next(delays)
                 async with Trace("retry", logger, request, kwargs) as trace:
                     await self._network_backend.sleep(delay)
+            except BaseException:
+                # Any other failure (including a `trace` callback exception or
+                # task cancellation) happens after a stream may already have
+                # been opened. Close it so the underlying socket cannot leak.
+                with AsyncShieldCancellation():
+                    if stream is not None:
+                        await stream.aclose()
+                raise
 
     def can_handle_request(self, origin: Origin) -> bool:
         return origin == self._origin
