@@ -38,6 +38,11 @@ class HTTPConnectionState(enum.IntEnum):
     ACTIVE = 1
     IDLE = 2
     CLOSED = 3
+    # The network stream has been handed over to the caller via the
+    # `"network_stream"` response extension, after a successful `101 Switching
+    # Protocols` or `CONNECT` response. While detached the connection no longer
+    # owns the socket and must never be reused or closed by the pool.
+    DETACHED = 4
 
 
 class HTTP11Connection(ConnectionInterface):
@@ -51,7 +56,7 @@ class HTTP11Connection(ConnectionInterface):
         keepalive_expiry: float | None = None,
     ) -> None:
         self._origin = origin
-        self._network_stream = stream
+        self._network_stream: NetworkStream | None = stream
         self._keepalive_expiry: float | None = keepalive_expiry
         self._expire_at: float | None = None
         self._state = HTTPConnectionState.NEW
@@ -111,13 +116,25 @@ class HTTP11Connection(ConnectionInterface):
                     headers,
                 )
 
-            network_stream = self._network_stream
-
             # CONNECT or Upgrade request
+            network_stream: NetworkStream
             if (status == 101) or (
                 (request.method == b"CONNECT") and (200 <= status < 300)
             ):
-                network_stream = HTTP11UpgradeStream(network_stream, trailing_data)
+                # The socket now carries the upgraded/tunnelled protocol.
+                # Transfer ownership of the network stream to the caller via
+                # the `"network_stream"` extension, and detach this connection
+                # so that it can never be pooled for another HTTP request or
+                # close the socket out from under the caller.
+                assert self._network_stream is not None
+                network_stream = HTTP11UpgradeStream(
+                    self._network_stream, trailing_data
+                )
+                self._network_stream = None
+                self._state = HTTPConnectionState.DETACHED
+            else:
+                assert self._network_stream is not None
+                network_stream = self._network_stream
 
             return Response(
                 status=status,
@@ -163,6 +180,7 @@ class HTTP11Connection(ConnectionInterface):
     def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
         if bytes_to_send is not None:
+            assert self._network_stream is not None
             self._network_stream.write(bytes_to_send, timeout=timeout)
 
     # Receiving the response...
@@ -214,6 +232,7 @@ class HTTP11Connection(ConnectionInterface):
                 event = self._h11_state.next_event()
 
             if event is h11.NEED_DATA:
+                assert self._network_stream is not None
                 data = self._network_stream.read(
                     self.READ_NUM_BYTES, timeout=timeout
                 )
@@ -237,6 +256,12 @@ class HTTP11Connection(ConnectionInterface):
 
     def _response_closed(self) -> None:
         with self._state_lock:
+            if self._state == HTTPConnectionState.DETACHED:
+                # The network stream now belongs to the caller of the upgraded
+                # connection. Closing the response only releases the connection
+                # back to the pool (where it is immediately discarded); it must
+                # not close the socket that the caller is still using.
+                return
             if (
                 self._h11_state.our_state is h11.DONE
                 and self._h11_state.their_state is h11.DONE
@@ -254,8 +279,15 @@ class HTTP11Connection(ConnectionInterface):
     def close(self) -> None:
         # Note that this method unilaterally closes the connection, and does
         # not have any kind of locking in place around it.
+        if self._state == HTTPConnectionState.DETACHED:
+            # The stream has been handed over to the caller and is no longer
+            # ours to close. Mark the connection closed for the pool's book
+            # keeping without touching the socket.
+            self._state = HTTPConnectionState.CLOSED
+            return
         self._state = HTTPConnectionState.CLOSED
-        self._network_stream.close()
+        if self._network_stream is not None:
+            self._network_stream.close()
 
     # The ConnectionInterface methods provide information about the state of
     # the connection, allowing for a connection pooling implementation to
@@ -280,6 +312,7 @@ class HTTP11Connection(ConnectionInterface):
         # a server-initiated disconnect.
         server_disconnected = (
             self._state == HTTPConnectionState.IDLE
+            and self._network_stream is not None
             and self._network_stream.get_extra_info("is_readable")
         )
 
@@ -289,7 +322,13 @@ class HTTP11Connection(ConnectionInterface):
         return self._state == HTTPConnectionState.IDLE
 
     def is_closed(self) -> bool:
-        return self._state == HTTPConnectionState.CLOSED
+        # A detached connection has surrendered its socket to the caller of an
+        # upgraded connection, so from the pool's perspective it is finished and
+        # must be removed rather than reused.
+        return self._state in (
+            HTTPConnectionState.CLOSED,
+            HTTPConnectionState.DETACHED,
+        )
 
     def info(self) -> str:
         origin = str(self._origin)
@@ -349,9 +388,24 @@ class HTTP11ConnectionByteStream:
 
 
 class HTTP11UpgradeStream(NetworkStream):
+    """
+    The sole owner of the socket after a successful `101 Switching Protocols`
+    or `CONNECT` response.
+
+    Any protocol bytes already buffered while reading the response headers are
+    delivered through `read()` before the underlying stream is read again, so
+    the upgraded protocol data is handed over exactly once, in order.
+
+    The originating HTTP/1.1 connection detaches itself when this stream is
+    created, which means closing the response or the connection pool never
+    closes the underlying socket. Callers are responsible for closing this
+    stream once the upgraded session is finished.
+    """
+
     def __init__(self, stream: NetworkStream, leading_data: bytes) -> None:
         self._stream = stream
         self._leading_data = leading_data
+        self._closed = False
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         if self._leading_data:
@@ -365,7 +419,9 @@ class HTTP11UpgradeStream(NetworkStream):
         self._stream.write(buffer, timeout)
 
     def close(self) -> None:
-        self._stream.close()
+        if not self._closed:
+            self._closed = True
+            self._stream.close()
 
     def start_tls(
         self,

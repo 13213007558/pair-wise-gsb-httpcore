@@ -226,6 +226,24 @@ This API can be used as the foundation for working with HTTP proxies, WebSocket 
 
 See the [network backends documentation](network-backends.md) for more information on working directly with network streams.
 
+#### Stream ownership and closing order
+
+For a successful `101 Switching Protocols` response, or a successful `CONNECT` response (a `2xx` status), the socket stops carrying HTTP and becomes the transport for the upgraded or tunnelled protocol. At that point ownership of the socket is transferred, once, from the HTTP/1.1 connection to the `network_stream` returned in the response extension:
+
+* The returned upgrade stream is the **sole owner** of the socket. `httpcore` does not keep a second reference that could read from or write to the same socket.
+* Any protocol bytes that had already been read from the socket together with the response headers are buffered by the upgrade stream and delivered through `read()` first, in order and exactly once, before the underlying socket is read again.
+* The underlying HTTP/1.1 connection is *detached*. It is removed from the connection pool and can never be assigned to another HTTP request, so an ordinary request cannot accidentally consume bytes belonging to the upgraded protocol.
+
+The three ways of closing a resource have distinct responsibilities:
+
+1. **Closing the response** (`response.close()` / `await response.aclose()`, including leaving a `with pool.stream(...)` block) releases the detached connection back to the pool, where it is discarded. It does **not** close the socket, so the upgraded session keeps running.
+2. **Closing the connection pool** (`pool.close()` / `await pool.aclose()`, including leaving the pool's context manager) discards the detached connection without closing the socket that was handed over. This makes it safe to close a pool while an upgraded session is still in progress.
+3. **Closing the upgrade stream** (`network_stream.close()` / `await network_stream.aclose()`) is the only operation that closes the underlying socket. The caller is responsible for doing this once the upgraded or tunnelled session is finished. Closing it more than once is safe and has no additional effect.
+
+The required ordering is therefore: finish the HTTP/1.1 upgrade exchange and take the `network_stream`, run the upgraded protocol, then close the upgrade stream when done. The response and the pool may be closed at any point without affecting the socket; they do not need to remain open for the lifetime of the upgraded session.
+
+If an upgrade is **rejected** with an ordinary HTTP response (for example a `200 OK` instead of a `101`), no ownership transfer occurs. The response is a normal HTTP/1.1 response: the connection returns to the pool as an idle keep-alive connection and is reused for subsequent ordinary requests, exactly as it would be without the `Upgrade` headers.
+
 ##### `CONNECT` requests
 
 A proxy CONNECT request using the network stream:
@@ -253,6 +271,10 @@ with httpcore.stream("CONNECT", url, extensions=extensions) as response:
     network_stream.write(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
     data = network_stream.read()
     print(data)
+
+# Closing the response does not close the tunnel; the caller owns the stream
+# and is responsible for closing the underlying socket.
+network_stream.close()
 ```
 
 ##### `Upgrade` requests
@@ -277,7 +299,8 @@ with httpcore.stream("GET", url, headers=headers) as response:
     if response.status != 101:
         raise Exception("Failed to upgrade to websockets", response)
 
-    # Get the raw network stream.
+    # Get the raw network stream. From this point the stream is the sole
+    # owner of the socket; closing the response or the pool will not close it.
     network_steam = response.extensions["network_stream"]
 
     # Write a WebSocket text frame to the stream.
@@ -297,6 +320,10 @@ with httpcore.stream("GET", url, headers=headers) as response:
     message = wsproto.events.CloseConnection(code=1000)
     outgoing_data = ws_connection.send(message)
     network_steam.write(outgoing_data)
+
+# The response is closed on leaving the block above, but the socket stays open.
+# The caller closes the upgraded stream once the session is complete.
+network_steam.close()
 ```
 
 ##### Extra network information

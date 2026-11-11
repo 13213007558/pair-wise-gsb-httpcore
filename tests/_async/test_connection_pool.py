@@ -835,3 +835,150 @@ async def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+class _StatefulBackend(httpcore.AsyncMockBackend):
+    """Hands each new connection the next buffered script from `scripts`."""
+
+    def __init__(self, scripts: list[list[bytes]]) -> None:
+        super().__init__([])
+        self._scripts = list(scripts)
+        self.streams: list[httpcore.AsyncMockStream] = []
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        stream = httpcore.AsyncMockStream(list(self._scripts.pop(0)))
+        self.streams.append(stream)
+        return stream
+
+
+@pytest.mark.anyio
+async def test_http11_upgrade_connection_is_removed_from_pool():
+    """
+    After a 101 upgrade the detached connection is dropped from the pool when
+    the response is closed, and the underlying socket stays open for the
+    caller's upgraded protocol. The next ordinary request gets a brand new
+    connection and can never read the upgraded protocol bytes.
+    """
+    network_backend = _StatefulBackend(
+        scripts=[
+            # First connection: an upgraded socket with protocol data.
+            [
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Connection: upgrade\r\n"
+                b"Upgrade: custom\r\n"
+                b"\r\n"
+                b"upgraded-bytes",
+            ],
+            # Second connection: a plain HTTP response.
+            [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n",
+                b"Hello, world!",
+            ],
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        network_backend=network_backend, max_connections=1
+    ) as pool:
+        async with pool.stream(
+            "GET",
+            "https://example.com/",
+            headers={"Connection": "upgrade", "Upgrade": "custom"},
+        ) as response:
+            assert response.status == 101
+            upgraded_stream = response.extensions["network_stream"]
+            # While the response is open the connection is marked detached and
+            # therefore unavailable to any other request.
+            assert all(not c.is_available() for c in pool.connections)
+
+        # Closing the response removes the detached connection from the pool,
+        # without closing the socket that now carries the upgraded protocol.
+        assert pool.connections == []
+        assert network_backend.streams[0]._closed is False
+
+        # The upgraded protocol data is delivered once, via the upgrade stream.
+        assert await upgraded_stream.read(max_bytes=1024) == b"upgraded-bytes"
+
+        # A subsequent ordinary request opens a fresh connection rather than
+        # reusing the upgraded socket, so it never sees the upgraded data.
+        async with pool.stream("GET", "https://example.com/") as response:
+            assert response.status == 200
+            assert await response.aread() == b"Hello, world!"
+
+        assert len(network_backend.streams) == 2
+        assert network_backend.streams[0]._closed is False
+        # The caller remains the sole owner and closes the upgraded socket.
+        await upgraded_stream.aclose()
+        assert network_backend.streams[0]._closed is True
+
+
+@pytest.mark.anyio
+async def test_http11_pool_close_while_upgrade_stream_in_use():
+    """
+    Closing the connection pool while the caller still owns an upgraded stream
+    must not close the underlying socket. The caller's stream is the only
+    owner and is responsible for closing it.
+    """
+    network_backend = _StatefulBackend(
+        scripts=[
+            [
+                b"HTTP/1.1 200 Connection established\r\n\r\n",
+                b"tunnel-bytes",
+            ]
+        ]
+    )
+
+    pool = httpcore.AsyncConnectionPool(network_backend=network_backend)
+    async with pool.stream("CONNECT", "http://example.com:443") as response:
+        assert response.status == 200
+        network_stream = response.extensions["network_stream"]
+        await pool.aclose()
+        # The pool is gone but the tunnel socket is still owned by the caller.
+        assert network_backend.streams[0]._closed is False
+        assert await network_stream.read(max_bytes=1024) == b"tunnel-bytes"
+
+    await network_stream.aclose()
+    assert network_backend.streams[0]._closed is True
+
+
+@pytest.mark.anyio
+async def test_http11_rejected_upgrade_is_reused_by_pool():
+    """
+    A rejected upgrade is just a normal HTTP response: the connection returns
+    to the pool IDLE and the next ordinary request reuses the same socket
+    without ever seeing upgrade-only data.
+    """
+    network_backend = _StatefulBackend(
+        scripts=[
+            [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nworld",
+            ]
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        async with pool.stream(
+            "GET",
+            "https://example.com/",
+            headers={"Connection": "upgrade", "Upgrade": "custom"},
+        ) as response:
+            assert response.status == 200
+            assert await response.aread() == b"hello"
+
+        assert len(pool.connections) == 1
+        assert pool.connections[0].is_idle()
+
+        async with pool.stream("GET", "https://example.com/") as response:
+            assert response.status == 200
+            assert await response.aread() == b"world"
+
+        # Only one socket was ever opened: the connection was reused.
+        assert len(network_backend.streams) == 1

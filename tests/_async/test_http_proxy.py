@@ -5,6 +5,7 @@ import hpack
 import hyperframe.frame
 import pytest
 
+import httpcore
 from httpcore import (
     SOCKET_OPTION,
     AsyncConnectionPool,
@@ -125,7 +126,55 @@ async def test_proxy_tunneling():
         )
 
 
-# We need to adapt the mock backend here slightly in order to deal
+@pytest.mark.anyio
+async def test_proxy_connect_with_trailing_data():
+    """
+    Tunnel bytes that the socket delivered together with the CONNECT response
+    headers are retained on the upgraded stream and delivered exactly once.
+    The detached HTTP/1.1 connection and its pool neither close nor reuse the
+    surrendered socket; only the caller's upgrade stream closes it.
+    """
+
+    class TrackingStream(AsyncMockStream):
+        def __init__(self, buffer: list[bytes]) -> None:
+            super().__init__(buffer)
+            self.close_count = 0
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+            await super().aclose()
+
+    network_stream = TrackingStream(
+        [
+            # The CONNECT response and the first tunnel bytes arrive together.
+            b"HTTP/1.1 200 OK\r\n\r\npre-buffered",
+            b"rest-of-tunnel",
+        ]
+    )
+    origin = Origin(b"http", b"localhost", 8080)
+    connection = httpcore.AsyncHTTP11Connection(origin=origin, stream=network_stream)
+
+    async with connection.stream("CONNECT", "http://localhost:8080") as response:
+        assert response.status == 200
+        tunnel_stream = response.extensions["network_stream"]
+        assert await tunnel_stream.read(max_bytes=12) == b"pre-buffered"
+        assert await tunnel_stream.read(max_bytes=1024) == b"rest-of-tunnel"
+        # The connection has detached and cannot be reused.
+        assert connection.is_closed()
+        assert not connection.is_available()
+
+    # Closing the response must not close the tunnel socket.
+    assert network_stream.close_count == 0
+
+    # Closing the detached connection must not close the tunnel socket either.
+    await connection.aclose()
+    assert network_stream.close_count == 0
+
+    # Only the caller's upgrade stream closes the underlying socket, once.
+    await tunnel_stream.aclose()
+    assert network_stream.close_count == 1
+
+
 # with the proxy case. We do not want the initial connection to the proxy
 # to indicate an HTTP/2 connection, but we do want it to indicate HTTP/2
 # once the SSL upgrade has taken place.

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## Unreleased
 
 - Fix `max_keepalive_connections` not being properly handled. (#1000)
+- Tighten stream ownership after an HTTP/1.1 `101 Switching Protocols` or successful `CONNECT` response. The HTTP/1.1 connection now detaches and transfers sole ownership of the socket to the `network_stream` response extension, so closing the response or the connection pool no longer closes the socket carrying the upgraded protocol, and the detached connection can never be reused for an ordinary HTTP request.
 
 ## Version 1.0.9 (April 24th, 2025)
 
