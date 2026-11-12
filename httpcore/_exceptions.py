@@ -39,6 +39,19 @@ class LocalProtocolError(ProtocolError):
     pass
 
 
+class RequestAbortedError(ProtocolError):
+    """
+    Raised when the server stops accepting a request body before it has been
+    fully sent, for example by responding early (an ``END_STREAM`` on the
+    response) while the upload is still blocked on HTTP/2 flow control.
+
+    Unlike a connection failure, this only terminates the individual request
+    stream, so the underlying connection may still be reused.
+    """
+
+    pass
+
+
 # Timeout errors
 
 

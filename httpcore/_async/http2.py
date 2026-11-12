@@ -11,12 +11,14 @@ import h2.connection
 import h2.events
 import h2.exceptions
 import h2.settings
+import h2.stream
 
 from .._backends.base import AsyncNetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
     RemoteProtocolError,
+    RequestAbortedError,
 )
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
@@ -180,6 +182,11 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 # it as a RemoteProtocolError.
                 if self._connection_terminated:  # pragma: nocover
                     raise RemoteProtocolError(self._connection_terminated)
+                # h2 raises StreamClosedError when we write to a stream the
+                # remote peer has already reset. That is a remote failure of
+                # this single stream, not a local protocol violation.
+                if isinstance(exc, h2.exceptions.StreamClosedError):
+                    raise RemoteProtocolError(exc)
                 # If h2 raises a protocol error in some other state then we
                 # must somehow have made a protocol violation.
                 raise LocalProtocolError(exc)  # pragma: nocover
@@ -253,14 +260,53 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
     async def _send_request_body(self, request: Request, stream_id: int) -> None:
         """
         Iterate over the request body sending it to a given stream ID.
+
+        Aborts early if the server terminates the stream (RST_STREAM, GOAWAY)
+        or starts responding before the body has been fully uploaded, instead
+        of blocking forever on flow control. Any abandoned upload sends a
+        RST_STREAM so the server can release its state, and the upstream body
+        iterator is always closed deterministically.
         """
         if not has_body_headers(request):
             return
 
         assert isinstance(request.stream, typing.AsyncIterable)
-        async for data in request.stream:
-            await self._send_stream_data(request, stream_id, data)
-        await self._send_end_stream(request, stream_id)
+        try:
+            async for data in request.stream:
+                # Notice a rejection/reset that arrived while flow was still
+                # available, rather than only once we block on flow control.
+                self._raise_if_stream_aborted(stream_id)
+                await self._send_stream_data(request, stream_id, data)
+            await self._send_end_stream(request, stream_id)
+        except BaseException:
+            await self._abort_request_body(request, stream_id)
+            raise
+
+    async def _abort_request_body(self, request: Request, stream_id: int) -> None:
+        """
+        Tear down an upload that could not be completed:
+
+        * Close the upstream body generator, so its resources are released
+          even though it was not fully consumed.
+        * Send a RST_STREAM on the request stream if it is still open locally,
+          cancelling the remainder of the upload without closing the
+          underlying connection.
+        """
+        close = getattr(request.stream, "aclose", None)
+        if close is not None:
+            await close()
+
+        stream = self._h2_state.streams.get(stream_id)
+        remote_reset = stream is not None and (
+            stream.closed_by == h2.stream.StreamClosedBy.RECV_RST_STREAM
+        )
+        if stream is not None and not stream.closed and not remote_reset:
+            try:
+                self._h2_state.reset_stream(stream_id, h2.exceptions.ErrorCodes.CANCEL)
+                await self._write_outgoing_data(request)
+            except h2.exceptions.ProtocolError:
+                # The stream (or connection) is already closed; nothing to do.
+                pass
 
     async def _send_stream_data(
         self, request: Request, stream_id: int, data: bytes
@@ -492,16 +538,74 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         If the allowable flow is zero, then waits on the network until
         WindowUpdated frames have increased the flow rate.
         https://tools.ietf.org/html/rfc7540#section-6.9
+
+        While waiting, also notices if the server has reset the stream, closed
+        the connection, or begun responding early, so that an upload blocked on
+        flow control is aborted rather than hanging until the body is exhausted.
         """
         local_flow: int = self._h2_state.local_flow_control_window(stream_id)
         max_frame_size: int = self._h2_state.max_outbound_frame_size
         flow = min(local_flow, max_frame_size)
         while flow == 0:
             await self._receive_events(request)
+            self._raise_if_stream_aborted(stream_id)
             local_flow = self._h2_state.local_flow_control_window(stream_id)
             max_frame_size = self._h2_state.max_outbound_frame_size
             flow = min(local_flow, max_frame_size)
         return flow
+
+    def _raise_if_stream_aborted(self, stream_id: int) -> None:
+        """
+        Raise if the request stream can no longer accept the remaining body.
+
+        * A GOAWAY tears the whole connection down -> RemoteProtocolError.
+        * A RST_STREAM closes just this stream -> RemoteProtocolError, leaving
+          the connection usable for other requests.
+        * A response that ended the remote half (early 401/413 with
+          END_STREAM) means the server will never grant more upload window ->
+          RequestAbortedError. Only this request stream is affected, so the
+          underlying connection stays reusable.
+        """
+        if self._connection_terminated is not None:
+            raise RemoteProtocolError(self._connection_terminated)
+
+        reset = next(
+            (
+                event
+                for event in self._events.get(stream_id, ())
+                if isinstance(event, h2.events.StreamReset)
+            ),
+            None,
+        )
+        if reset is not None:
+            raise RemoteProtocolError(reset)
+
+        stream = self._h2_state.streams.get(stream_id)
+        if stream is not None and stream.closed:
+            # The h2 state machine marks the stream closed on a remote
+            # RST_STREAM even before the event is consumed.
+            raise RemoteProtocolError(
+                f"Stream {stream_id} was reset by the remote peer"
+            )
+
+        if self._remote_half_closed(stream_id):
+            raise RequestAbortedError(
+                f"Server responded before the request body on stream {stream_id} "
+                "was fully sent"
+            )
+
+    def _remote_half_closed(self, stream_id: int) -> bool:
+        """
+        Return True if the server has ended its side of the stream (for
+        example by sending an early response with END_STREAM) while the
+        request body is still being uploaded and we have not ended ours.
+        """
+        stream = self._h2_state.streams.get(stream_id)
+        if stream is None:
+            return False
+        return (
+            stream.state_machine.state == h2.stream.StreamState.HALF_CLOSED_REMOTE
+        )
 
     # Interface for connection pooling...
 
